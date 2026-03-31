@@ -16,6 +16,8 @@ export default function AddSalon() {
     pincode: "", phone: "", email: "",
   });
   const [ownerEmail, setOwnerEmail] = useState("");
+  const [ownerName, setOwnerName] = useState("");
+  const [ownerPhone, setOwnerPhone] = useState("");
   const [creatingOwner, setCreatingOwner] = useState(false);
   const [location, setLocation] = useState({ lat: "", lng: "" });
   const [locating, setLocating] = useState(false);
@@ -81,7 +83,7 @@ export default function AddSalon() {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${idToken}`,
           },
-          body: JSON.stringify({ data: { email: ownerEmail.trim(), name: "", phone: "" } }),
+          body: JSON.stringify({ data: { email: ownerEmail.trim(), name: ownerName.trim(), phone: ownerPhone.trim() } }),
         }
       );
       const fnJson = await fnRes.json();
@@ -100,6 +102,8 @@ export default function AddSalon() {
       toast.success(`Salon added! ID: ${id}`);
       setForm({ name:"", owner_uid:"", address:"", city:"", state:"", pincode:"", phone:"", email:"" });
       setOwnerEmail("");
+      setOwnerName("");
+      setOwnerPhone("");
       setLocation({ lat: "", lng: "" });
       setHours(defaultHours);
       setLogoFile(null);
@@ -136,12 +140,30 @@ export default function AddSalon() {
             </div>
           ))}
           <div className="flex flex-col gap-1">
-            <label className="text-xs text-gray-400">Owner Email (will be created automatically)</label>
+            <label className="text-xs text-gray-400">Owner Email (account will be created automatically)</label>
             <input
               value={ownerEmail}
               onChange={e => setOwnerEmail(e.target.value)}
               type="email"
               placeholder="owner@salon.com"
+              className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-gray-400">Owner Name</label>
+            <input
+              value={ownerName}
+              onChange={e => setOwnerName(e.target.value)}
+              placeholder="Full name"
+              className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-gray-400">Owner Phone</label>
+            <input
+              value={ownerPhone}
+              onChange={e => setOwnerPhone(e.target.value)}
+              placeholder="+91 98765 43210"
               className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
             />
           </div>

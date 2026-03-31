@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { getIdToken } from "firebase/auth";
-import { addSalon, uploadSalonGalleryItem, updateSalon } from "../../../lib/adminFirestore";
+import { addSalonFull } from "../../../lib/adminFirestore";
 import { auth } from "../../../firebase";
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
@@ -89,21 +89,13 @@ export default function AddSalon() {
       const ownerUid = fnJson.result?.uid;
       if (!ownerUid) throw new Error("createSalonOwner did not return uid");
 
-      const id = await addSalon(
+      // all file uploads (logo + cover + gallery) happen in parallel — single updateDoc
+      const id = await addSalonFull(
         { ...form, owner_uid: ownerUid, location: { lat, lng }, working_hours: hours },
         logoFile,
         coverFile,
+        galleryFiles,
       );
-
-      let gallery = [];
-      if (galleryFiles.length) {
-        gallery = await Promise.all(
-          galleryFiles.map((file, idx) => uploadSalonGalleryItem(id, file, idx)),
-        );
-      }
-      if (gallery.length) {
-        await updateSalon(id, { ...form, location: { lat, lng }, working_hours: hours }, null, null, gallery);
-      }
 
       toast.success(`Salon added! ID: ${id}`);
       setForm({ name:"", owner_uid:"", address:"", city:"", state:"", pincode:"", phone:"", email:"" });

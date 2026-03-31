@@ -266,13 +266,60 @@ export async function addSalon(data, logoFile, coverFile) {
       updated_at: serverTimestamp(),
     });
   });
+  // upload logo + cover in parallel
+  const [logoUrl, coverUrl] = await Promise.all([
+    logoFile ? uploadFile(`salons/${docRef.id}/logo.jpg`, logoFile) : Promise.resolve(null),
+    coverFile ? uploadFile(`salons/${docRef.id}/cover.jpg`, coverFile) : Promise.resolve(null),
+  ]);
   const updates = {};
-  if (logoFile)
-    updates.logo_url = await uploadFile(`salons/${docRef.id}/logo.jpg`, logoFile);
-  if (coverFile)
-    updates.cover_photo = await uploadFile(`salons/${docRef.id}/cover.jpg`, coverFile);
+  if (logoUrl) updates.logo_url = logoUrl;
+  if (coverUrl) updates.cover_photo = coverUrl;
   if (Object.keys(updates).length) await updateDoc(docRef, updates);
   return docRef.id;
+}
+
+// Faster variant for AddSalon: creates doc then uploads logo + cover + gallery
+// all in parallel, finishing with a single updateDoc instead of two.
+export async function addSalonFull(data, logoFile, coverFile, galleryFiles = []) {
+  const _db = requireDb();
+  const docRef = doc(collection(_db, "salons"));
+  await runTransaction(_db, async tx => {
+    tx.set(docRef, {
+      name: data.name,
+      owner_uid: data.owner_uid,
+      address: data.address,
+      location: toGeoPoint(data.location),
+      city: data.city,
+      state: data.state,
+      pincode: data.pincode,
+      phone: data.phone,
+      email: data.email,
+      logo_url: "",
+      cover_photo: "",
+      gallery: [],
+      working_hours: data.working_hours,
+      slot_interval_minutes: 5,
+      avg_rating: 0,
+      review_count: 0,
+      is_active: true,
+      is_verified: true,
+      created_at: serverTimestamp(),
+      updated_at: serverTimestamp(),
+    });
+  });
+  const id = docRef.id;
+  // upload everything in parallel
+  const [logoUrl, coverUrl, ...galleryItems] = await Promise.all([
+    logoFile ? uploadFile(`salons/${id}/logo.jpg`, logoFile) : Promise.resolve(null),
+    coverFile ? uploadFile(`salons/${id}/cover.jpg`, coverFile) : Promise.resolve(null),
+    ...galleryFiles.map((file, idx) => uploadSalonGalleryItem(id, file, idx)),
+  ]);
+  const updates = { updated_at: serverTimestamp() };
+  if (logoUrl) updates.logo_url = logoUrl;
+  if (coverUrl) updates.cover_photo = coverUrl;
+  if (galleryItems.length) updates.gallery = galleryItems;
+  await updateDoc(docRef, updates);
+  return id;
 }
 
 export async function updateSalon(id, data, logoFile, coverFile, gallery) {
@@ -293,8 +340,8 @@ export async function updateSalon(id, data, logoFile, coverFile, gallery) {
       email: data.email,
       gallery: Array.isArray(gallery) ? gallery : (data.gallery ?? []),
       working_hours: data.working_hours,
-      is_active: data.is_active,
-      is_verified: data.is_verified,
+      is_active: data.is_active ?? true,
+      is_verified: data.is_verified ?? true,
       updated_at: serverTimestamp(),
     });
   });

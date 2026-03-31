@@ -1,5 +1,8 @@
 import { initializeApp, getApps } from "firebase/app";
+import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
+import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -15,14 +18,19 @@ const configured =
 
 let app = null;
 let db = null;
+let storage = null;
+let auth = null;
+let functions = null;
 
 if (configured) {
   app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
+  auth = getAuth(app);
   db = getFirestore(app);
+  storage = getStorage(app);
+  functions = getFunctions(app);
 } else if (import.meta.env.DEV) {
-  console.warn(
-    "IndSphinx: Firebase is not configured. Copy .env.example to .env and add your Firebase web app keys.",
-  );
+  console.warn("Firebase is not configured.");
 }
 
-export { app, db };
+export const firebaseConfigured = configured;
+export { app, auth, db, storage, functions };

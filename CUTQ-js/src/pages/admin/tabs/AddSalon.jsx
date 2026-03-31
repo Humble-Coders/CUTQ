@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { toast } from "sonner";
-import { httpsCallable } from "firebase/functions";
+import { getIdToken } from "firebase/auth";
 import { addSalon, uploadSalonGalleryItem, updateSalon } from "../../../lib/adminFirestore";
-import { functions } from "../../../firebase";
+import { auth } from "../../../firebase";
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
 
@@ -72,13 +72,21 @@ export default function AddSalon() {
     setLoading(true);
     try {
       setCreatingOwner(true);
-      const createOwner = httpsCallable(functions, "createSalonOwner");
-      const res = await createOwner({
-        email: ownerEmail.trim(),
-        name: "",
-        phone: "",
-      });
-      const ownerUid = res?.data?.uid;
+      const idToken = await getIdToken(auth.currentUser);
+      const fnRes = await fetch(
+        "https://us-central1-cutq-e133a.cloudfunctions.net/createSalonOwner",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ data: { email: ownerEmail.trim(), name: "", phone: "" } }),
+        }
+      );
+      const fnJson = await fnRes.json();
+      if (fnJson.error) throw new Error(fnJson.error.message || "createSalonOwner failed");
+      const ownerUid = fnJson.result?.uid;
       if (!ownerUid) throw new Error("createSalonOwner did not return uid");
 
       const id = await addSalon(

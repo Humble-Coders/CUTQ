@@ -1,5 +1,6 @@
 const {setGlobalOptions} = require("firebase-functions/v2");
 const {onRequest} = require("firebase-functions/v2/https");
+const {onDocumentCreated} = require("firebase-functions/v2/firestore");
 const {defineSecret} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
@@ -237,5 +238,86 @@ exports.createSalonOwner = onRequest(
     ]);
 
     res.status(200).json({result: {uid, email}});
+  },
+);
+
+// ── Booking notifications ───────────────────────────────────────────────────
+// Sends an FCM message to the salon owner when a new booking is created.
+exports.onBookingCreatedNotifySalonOwner = onDocumentCreated(
+  "bookings/{bookingId}",
+  async (event) => {
+    const bookingId = event.params.bookingId;
+    const bookingData = event.data?.data?.() || {};
+
+    const salonId = bookingData.salon_id;
+    if (!salonId) {
+      logger.warn("Booking missing salon_id", {bookingId});
+      return;
+    }
+
+    try {
+      const salonSnap = await admin
+        .firestore()
+        .collection("salons")
+        .doc(salonId)
+        .get();
+
+      const salonData = salonSnap.exists ? salonSnap.data() : null;
+      const ownerUid = salonData?.owner_uid;
+      if (!ownerUid) {
+        logger.warn("Salon missing owner_uid", {bookingId, salonId});
+        return;
+      }
+
+      // We store fcm_token under Users/{owner_uid} (your app does this).
+      const ownerProfile = await getUserProfile(ownerUid);
+      const fcmToken = ownerProfile?.fcm_token;
+      if (!fcmToken) {
+        logger.warn("Owner has no fcm_token", {bookingId, salonId, ownerUid});
+        return;
+      }
+
+      // Format a short slot time for the message body (optional).
+      let slotText = "";
+      const slotStart = bookingData.slot_start;
+      if (slotStart?.toDate) {
+        const d = slotStart.toDate();
+        // Avoid locale quirks; keep it short.
+        slotText = ` at ${d.toISOString().replace("T", " ").slice(0, 16)}`;
+      }
+
+      const title = "New booking";
+      const body = `A new booking was created${slotText}.`;
+
+      // Android: use our app's channel id so it plays the custom sound if channel exists.
+      const channelId = "chat_messages";
+
+      const message = {
+        token: fcmToken,
+        android: {
+          priority: "high",
+          notification: {
+            channelId,
+          },
+        },
+        // Data-first so your Capacitor foreground handler can read title/body from payload.data.
+        data: {
+          title,
+          body,
+          bookingId: String(bookingId || ""),
+          salonId: String(salonId || ""),
+          type: "booking_created",
+        },
+        notification: {
+          title,
+          body,
+        },
+      };
+
+      await admin.messaging().send(message);
+      logger.info("Sent booking notification", {bookingId, ownerUid, salonId});
+    } catch (err) {
+      logger.error("Failed to send booking notification", {bookingId, salonId, err});
+    }
   },
 );

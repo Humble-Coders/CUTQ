@@ -1,5 +1,5 @@
 import {
-  collection, doc, updateDoc,
+  collection, doc, updateDoc, deleteDoc,
   getDocs, query, orderBy, serverTimestamp,
   runTransaction, onSnapshot, GeoPoint,
 } from "firebase/firestore";
@@ -367,4 +367,100 @@ export async function uploadSalonGalleryItem(salonId, file, display_order) {
   const id = makeId();
   const url = await uploadFile(`salons/${salonId}/gallery/${id}.jpg`, file);
   return { id, url, display_order: Number(display_order) };
+}
+
+// ─── Header Images (app_config/header) ──────────────────────────────
+function headerDocRef() {
+  return doc(requireDb(), "app_config", "header");
+}
+
+export function listenHeaderImages(callback) {
+  if (!db) {
+    callback({ images: [] });
+    return () => {};
+  }
+  return onSnapshot(headerDocRef(), snap => {
+    callback(snap.exists() ? snap.data() : { images: [] });
+  });
+}
+
+export async function addHeaderImage(file) {
+  const id = makeId();
+  const url = await uploadFile(`app_config/header/${id}.jpg`, file);
+  const _db = requireDb();
+  const ref_ = headerDocRef();
+  await runTransaction(_db, async tx => {
+    const snap = await tx.get(ref_);
+    const existing = snap.exists() ? (snap.data().images || []) : [];
+    const newItem = { id, url };
+    if (snap.exists()) {
+      tx.update(ref_, { images: [...existing, newItem] });
+    } else {
+      tx.set(ref_, { images: [newItem] });
+    }
+  });
+  return { id, url };
+}
+
+export async function removeHeaderImage(item) {
+  const _db = requireDb();
+  const ref_ = headerDocRef();
+  await runTransaction(_db, async tx => {
+    const snap = await tx.get(ref_);
+    if (!snap.exists()) return;
+    const existing = snap.data().images || [];
+    tx.update(ref_, { images: existing.filter(img => img.id !== item.id) });
+  });
+  await deleteFile(`app_config/header/${item.id}.jpg`);
+}
+
+// ─── Explore Section ─────────────────────────────────────────────────
+export function listenExploreSections(callback) {
+  const _db = requireDb();
+  const q = query(collection(_db, "explore_section"), orderBy("order"));
+  return onSnapshot(q, snap => {
+    callback(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+  });
+}
+
+export async function addExploreSection(data, imageFile) {
+  if (!imageFile) throw new Error("Image is required");
+  const _db = requireDb();
+  const docRef = doc(collection(_db, "explore_section"));
+  await runTransaction(_db, async tx => {
+    tx.set(docRef, {
+      title: data.title,
+      image_url: "",
+      category_id: data.category_id,
+      order: data.order,
+      created_at: serverTimestamp(),
+      updated_at: serverTimestamp(),
+    });
+  });
+  const url = await uploadFile(`explore_section/${docRef.id}/image.jpg`, imageFile);
+  await updateDoc(docRef, { image_url: url });
+  return docRef.id;
+}
+
+export async function updateExploreSection(id, data, imageFile) {
+  const _db = requireDb();
+  const ref_ = doc(_db, "explore_section", id);
+  await runTransaction(_db, async tx => {
+    const snap = await tx.get(ref_);
+    if (!snap.exists()) throw new Error("Explore section item not found");
+    tx.update(ref_, {
+      title: data.title,
+      category_id: data.category_id,
+      updated_at: serverTimestamp(),
+    });
+  });
+  if (imageFile) {
+    const url = await uploadFile(`explore_section/${id}/image.jpg`, imageFile);
+    await updateDoc(ref_, { image_url: url });
+  }
+}
+
+export async function deleteExploreSection(id) {
+  await deleteFile(`explore_section/${id}/image.jpg`);
+  await deleteDoc(doc(requireDb(), "explore_section", id));
 }

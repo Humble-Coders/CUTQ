@@ -3,12 +3,16 @@ import { toast } from "sonner";
 import AddSalon from "./tabs/AddSalon";
 import Categories from "./tabs/Categories";
 import Salons from "./tabs/Salons";
+import HeaderImages from "./tabs/HeaderImages";
+import ExploreSection from "./tabs/ExploreSection";
 import { listenAppConfig, updateBookingFee } from "../../lib/adminFirestore";
 
 const TABS = [
-  { id: "salons_list", label: "Salons" },
-  { id: "add_salon",   label: "Add Salon" },
-  { id: "categories", label: "Categories" },
+  { id: "salons_list",     label: "Salons" },
+  { id: "add_salon",       label: "Add Salon" },
+  { id: "categories",      label: "Categories" },
+  { id: "header_images",   label: "Header Images" },
+  { id: "explore_section", label: "Explore Section" },
 ];
 
 export default function AdminPanel() {
@@ -74,9 +78,11 @@ export default function AdminPanel() {
 
         {/* Content */}
         <main className="flex-1 p-6 overflow-y-auto">
-          {tab === "salons_list" && <Salons />}
-          {tab === "add_salon"   && <AddSalon />}
-          {tab === "categories"  && <Categories />}
+          {tab === "salons_list"     && <Salons />}
+          {tab === "add_salon"       && <AddSalon />}
+          {tab === "categories"      && <Categories />}
+          {tab === "header_images"   && <HeaderImages />}
+          {tab === "explore_section" && <ExploreSection />}
         </main>
       </div>
     </div>

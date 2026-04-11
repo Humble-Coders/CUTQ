@@ -5,14 +5,14 @@ import { listenSalons, updateSalon, toggleSalon, uploadSalonGalleryItem } from "
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
 
-function Field({ label, value, onChange, type = "text", textarea = false }) {
+function Field({ label, value, onChange, type = "text", textarea = false, min, step }) {
   const cls = "bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B] w-full";
   return (
     <div className="flex flex-col gap-1">
       <label className="text-xs text-gray-400">{label}</label>
       {textarea
         ? <textarea value={value} onChange={e => onChange(e.target.value)} rows={2} className={`${cls} resize-none`} />
-        : <input type={type} value={value} onChange={e => onChange(e.target.value)} className={cls} />
+        : <input type={type} value={value} onChange={e => onChange(e.target.value)} className={cls} min={min} step={step} />
       }
     </div>
   );
@@ -28,6 +28,7 @@ function EditSalonDrawer({ salon, onClose }) {
     city: salon.city || "",
     state: salon.state || "",
     pincode: salon.pincode || "",
+    max_bookings_per_slot: String(salon.max_bookings_per_slot ?? 1),
     is_active: salon.is_active ?? true,
     is_verified: salon.is_verified ?? true,
   });
@@ -94,6 +95,10 @@ function EditSalonDrawer({ salon, onClose }) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return toast.error("location (lat/lng) is required");
     }
+    const maxBookings = Number(form.max_bookings_per_slot);
+    if (!Number.isFinite(maxBookings) || maxBookings < 1) {
+      return toast.error("Max bookings per slot must be a number ≥ 1");
+    }
     setLoading(true);
     try {
       let nextGallery = normalizeGallery(gallery);
@@ -107,7 +112,13 @@ function EditSalonDrawer({ salon, onClose }) {
       }
       await updateSalon(
         salon.id,
-        { ...form, location: { lat, lng }, working_hours: hours, gallery: nextGallery },
+        {
+          ...form,
+          max_bookings_per_slot: form.max_bookings_per_slot,
+          location: { lat, lng },
+          working_hours: hours,
+          gallery: nextGallery,
+        },
         logoFile,
         coverFile,
         nextGallery
@@ -162,6 +173,14 @@ function EditSalonDrawer({ salon, onClose }) {
               <Field label="City" value={form.city} onChange={v => setField("city", v)} />
               <Field label="State" value={form.state} onChange={v => setField("state", v)} />
               <Field label="Pincode" value={form.pincode} onChange={v => setField("pincode", v)} />
+              <Field
+                label="Max bookings per slot"
+                value={form.max_bookings_per_slot}
+                onChange={v => setField("max_bookings_per_slot", v)}
+                type="number"
+                min="1"
+                step="1"
+              />
             </div>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Latitude" value={String(location.lat)} onChange={v => setLocation(p => ({ ...p, lat: v }))} />

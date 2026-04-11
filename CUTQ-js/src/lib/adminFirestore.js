@@ -32,6 +32,12 @@ function toGeoPoint(location) {
   return new GeoPoint(lat, lng);
 }
 
+function parseMaxBookingsPerSlot(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.floor(n);
+}
+
 // ─── Storage helpers ─────────────────────────────────────────────────
 export async function uploadFile(path, file) {
   const storageRef = ref(requireStorage(), path);
@@ -258,6 +264,7 @@ export async function addSalon(data, logoFile, coverFile) {
       gallery: [],
       working_hours: data.working_hours,
       slot_interval_minutes: 5,
+      max_bookings_per_slot: parseMaxBookingsPerSlot(data.max_bookings_per_slot),
       avg_rating: 0,
       review_count: 0,
       is_active: true,
@@ -299,6 +306,7 @@ export async function addSalonFull(data, logoFile, coverFile, galleryFiles = [])
       gallery: [],
       working_hours: data.working_hours,
       slot_interval_minutes: 5,
+      max_bookings_per_slot: parseMaxBookingsPerSlot(data.max_bookings_per_slot),
       avg_rating: 0,
       review_count: 0,
       is_active: true,
@@ -340,6 +348,7 @@ export async function updateSalon(id, data, logoFile, coverFile, gallery) {
       email: data.email,
       gallery: Array.isArray(gallery) ? gallery : (data.gallery ?? []),
       working_hours: data.working_hours,
+      max_bookings_per_slot: parseMaxBookingsPerSlot(data.max_bookings_per_slot),
       is_active: data.is_active ?? true,
       is_verified: data.is_verified ?? true,
       updated_at: serverTimestamp(),

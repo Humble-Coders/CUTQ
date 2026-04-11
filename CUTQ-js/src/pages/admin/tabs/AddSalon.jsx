@@ -14,6 +14,7 @@ export default function AddSalon() {
   const [form, setForm] = useState({
     name: "", owner_uid: "", address: "", city: "", state: "",
     pincode: "", phone: "", email: "",
+    max_bookings_per_slot: "1",
   });
   const [ownerEmail, setOwnerEmail] = useState("");
   const [ownerName, setOwnerName] = useState("");
@@ -71,6 +72,10 @@ export default function AddSalon() {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return toast.error("location (lat/lng) is required");
     }
+    const maxBookings = Number(form.max_bookings_per_slot);
+    if (!Number.isFinite(maxBookings) || maxBookings < 1) {
+      return toast.error("Max bookings per slot must be a number ≥ 1");
+    }
     setLoading(true);
     try {
       setCreatingOwner(true);
@@ -100,7 +105,11 @@ export default function AddSalon() {
       );
 
       toast.success(`Salon added! ID: ${id}`);
-      setForm({ name:"", owner_uid:"", address:"", city:"", state:"", pincode:"", phone:"", email:"" });
+      setForm({
+        name: "", owner_uid: "", address: "", city: "", state: "",
+        pincode: "", phone: "", email: "",
+        max_bookings_per_slot: "1",
+      });
       setOwnerEmail("");
       setOwnerName("");
       setOwnerPhone("");
@@ -130,13 +139,20 @@ export default function AddSalon() {
             { key: "email", label: "Email", type: "email" },
             { key: "city", label: "City" },
             { key: "state", label: "State" },
-            { key: "pincode", label: "Pincode" }
+            { key: "pincode", label: "Pincode" },
+            { key: "max_bookings_per_slot", label: "Max bookings per slot", type: "number" },
           ].map(({ key, label, type = "text" }) => (
             <div key={key} className="flex flex-col gap-1">
               <label className="text-xs text-gray-400">{label}</label>
-              <input type={type} value={form[key]} onChange={e => setField(key, e.target.value)}
+              <input
+                type={type}
+                min={type === "number" ? "1" : undefined}
+                step={type === "number" ? "1" : undefined}
+                value={form[key]}
+                onChange={e => setField(key, e.target.value)}
                 placeholder={label}
-                className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]" />
+                className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
+              />
             </div>
           ))}
           <div className="flex flex-col gap-1">

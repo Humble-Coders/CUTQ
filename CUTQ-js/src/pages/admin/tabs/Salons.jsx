@@ -28,6 +28,7 @@ function EditSalonDrawer({ salon, onClose }) {
     city: salon.city || "",
     state: salon.state || "",
     pincode: salon.pincode || "",
+    targeted_gender: salon.targeted_gender || "unisex",
     max_bookings_per_slot: String(salon.max_bookings_per_slot ?? 1),
     is_active: salon.is_active ?? true,
     is_verified: salon.is_verified ?? true,
@@ -167,6 +168,18 @@ function EditSalonDrawer({ salon, onClose }) {
             <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Basic Info</h3>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Salon Name" value={form.name} onChange={v => setField("name", v)} />
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-gray-400">targeted_gender</label>
+                <select
+                  value={form.targeted_gender}
+                  onChange={e => setField("targeted_gender", e.target.value)}
+                  className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white outline-none focus:border-[#18B79B] w-full"
+                >
+                  <option value="male" className="bg-[#0f0f0f]">Male</option>
+                  <option value="female" className="bg-[#0f0f0f]">Female</option>
+                  <option value="unisex" className="bg-[#0f0f0f]">Unisex</option>
+                </select>
+              </div>
               <Field label="Owner UID" value={form.owner_uid} onChange={v => setField("owner_uid", v)} />
               <Field label="Phone" value={form.phone} onChange={v => setField("phone", v)} />
               <Field label="Email" value={form.email} onChange={v => setField("email", v)} type="email" />

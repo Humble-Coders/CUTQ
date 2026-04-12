@@ -118,6 +118,7 @@ Each item in `images[]`:
 | Field | Type | Notes |
 |-------|------|-------|
 | `name` | string | Salon display name |
+| `targeted_gender` | string | `"male"` \| `"female"` \| `"unisex"` — who the salon primarily serves |
 | `owner_uid` | string | Firebase Auth UID — links to `Users/{owner_uid}` |
 | `address` | string | |
 | `location` | GeoPoint \| null | Derived from lat/lng; `null` if invalid or missing |

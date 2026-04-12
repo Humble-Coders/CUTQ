@@ -321,3 +321,162 @@ exports.onBookingCreatedNotifySalonOwner = onDocumentCreated(
     }
   },
 );
+
+// ── Booking validation ─────────────────────────────────────────────────────────
+// Triggered on every new booking document.
+// Validates slot timing, working hours, capacity, blocked slots, and booking fee.
+// On failure: sets status = "cancelled" with a reason.
+// On success: does nothing — booking stays "pending" for salon owner to manage.
+
+function parseTimeToMinutes(timeStr) {
+  const parts = (timeStr || "0:0").split(":");
+  return parseInt(parts[0] || "0") * 60 + parseInt(parts[1] || "0");
+}
+
+// Extract { weekday, totalMinutes } in the given IANA timezone.
+// weekday is lowercase ("monday", "tuesday", …).
+// totalMinutes is hours*60 + minutes in local time.
+function getLocalTimeParts(date, timezone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    weekday: "long",
+    hour: "numeric",
+    minute: "numeric",
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value ?? "0";
+  const hour = parseInt(get("hour")); // 0–23
+  const minute = parseInt(get("minute"));
+  const weekday = get("weekday").toLowerCase();
+  return {weekday, totalMinutes: hour * 60 + minute};
+}
+
+exports.validateBookingOnCreate = onDocumentCreated(
+  "bookings/{bookingId}",
+  async (event) => {
+    const bookingId = event.params.bookingId;
+    const booking = event.data?.data?.() || {};
+
+    // Only validate pending bookings created by the app
+    if (booking.status !== "pending") return;
+
+    const db = admin.firestore();
+
+    const cancelBooking = async (reason) => {
+      logger.warn("Cancelling booking", {bookingId, reason});
+      await db.collection("bookings").doc(bookingId).update({
+        status: "cancelled",
+        cancellation_reason: reason,
+        cancelled_by: "system",
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    };
+
+    try {
+      const salonId = booking.salon_id;
+      const serviceId = booking.service_id;
+      const slotStart = booking.slot_start?.toDate?.();
+      const slotEnd = booking.slot_end?.toDate?.();
+
+      if (!salonId || !serviceId || !slotStart || !slotEnd) {
+        return cancelBooking("INVALID_BOOKING: Missing required fields (salon_id, service_id, slot_start, slot_end)");
+      }
+
+      // 1. Salon must exist and be active
+      const salonSnap = await db.collection("salons").doc(salonId).get();
+      if (!salonSnap.exists || salonSnap.data().is_active === false) {
+        return cancelBooking("SALON_NOT_FOUND: Salon not found or inactive");
+      }
+      const salon = salonSnap.data();
+
+      // 2. Service must exist and be active
+      const serviceSnap = await db.collection("salons").doc(salonId)
+        .collection("services").doc(serviceId).get();
+      if (!serviceSnap.exists || serviceSnap.data().is_active === false) {
+        return cancelBooking("SERVICE_NOT_FOUND: Service not found or inactive");
+      }
+
+      // 3. Booking fee snapshot must match current global fee (only checked when fee > 0)
+      if ((booking.booking_fee || 0) > 0) {
+        const settingsSnap = await db.collection("app_config").doc("settings").get();
+        const currentFee = settingsSnap.exists ? (settingsSnap.data().booking_fee ?? 0) : 0;
+        if (booking.booking_fee !== currentFee) {
+          return cancelBooking(`BOOKING_FEE_MISMATCH: Booking fee has changed to ₹${currentFee}. Please restart and try again.`);
+        }
+      }
+
+      // 4. Slot must be at least 30 minutes in the future
+      const now = new Date();
+      const minTime = new Date(now.getTime() + 30 * 60 * 1000);
+      if (slotStart < minTime) {
+        return cancelBooking("SLOT_TOO_SOON: Slot must be at least 30 minutes from now");
+      }
+
+      // 5. Working hours — slot must be within salon open hours on that day.
+      // Cloud Functions run in UTC; working_hours strings are in the salon's local time,
+      // so we must convert using the salon's timezone (defaults to Asia/Kolkata).
+      const tz = salon.timezone || "Asia/Kolkata";
+      const {weekday: dayKey, totalMinutes: startMin} = getLocalTimeParts(slotStart, tz);
+      const {totalMinutes: endMin} = getLocalTimeParts(slotEnd, tz);
+      const dayHours = salon.working_hours?.[dayKey];
+      if (!dayHours || dayHours.is_closed === true) {
+        return cancelBooking("SALON_CLOSED: Salon is closed on this day");
+      }
+      const openMin = parseTimeToMinutes(dayHours.open);
+      const closeMin = parseTimeToMinutes(dayHours.close);
+      if (startMin < openMin || endMin > closeMin) {
+        return cancelBooking("OUTSIDE_WORKING_HOURS: Slot is outside salon working hours");
+      }
+
+      // 6. Capacity check — count non-cancelled bookings overlapping this slot
+      const dayStart = new Date(slotStart);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(dayStart);
+      dayEnd.setDate(dayEnd.getDate() + 1);
+
+      const bookingsSnap = await db.collection("bookings")
+        .where("salon_id", "==", salonId)
+        .where("slot_start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
+        .where("slot_start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
+        .get();
+
+      const maxBookings = salon.max_bookings_per_slot ?? 1;
+      const overlapping = bookingsSnap.docs.filter((doc) => {
+        if (doc.id === bookingId) return false;
+        const d = doc.data();
+        if (d.status === "cancelled") return false;
+        const bStart = d.slot_start?.toDate?.();
+        const bEnd = d.slot_end?.toDate?.();
+        if (!bStart || !bEnd) return false;
+        return bStart < slotEnd && bEnd > slotStart; // interval overlap
+      });
+      if (overlapping.length >= maxBookings) {
+        return cancelBooking("SLOT_FULL: This time slot is fully booked");
+      }
+
+      // 7. Blocked slots — fetch day's blocks and check overlap in memory
+      const blockedSnap = await db.collection("salons").doc(salonId)
+        .collection("blocked_slots")
+        .where("start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
+        .where("start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
+        .get();
+
+      const isBlocked = blockedSnap.docs.some((doc) => {
+        const d = doc.data();
+        const bStart = d.start?.toDate?.();
+        const bEnd = d.end?.toDate?.();
+        if (!bStart || !bEnd) return false;
+        return bStart < slotEnd && bEnd > slotStart;
+      });
+      if (isBlocked) {
+        return cancelBooking("SLOT_BLOCKED: This time slot is blocked by the salon");
+      }
+
+      // All checks passed — booking stays "pending"
+      logger.info("Booking validation passed", {bookingId, salonId});
+    } catch (err) {
+      logger.error("Unexpected error during booking validation", {bookingId, err});
+      await cancelBooking("INTERNAL_ERROR: " + (err.message || "Unknown error"));
+    }
+  },
+);

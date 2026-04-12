@@ -14,6 +14,7 @@ export default function AddSalon() {
   const [form, setForm] = useState({
     name: "", owner_uid: "", address: "", city: "", state: "",
     pincode: "", phone: "", email: "",
+    targeted_gender: "unisex",
     max_bookings_per_slot: "1",
   });
   const [ownerEmail, setOwnerEmail] = useState("");
@@ -108,6 +109,7 @@ export default function AddSalon() {
       setForm({
         name: "", owner_uid: "", address: "", city: "", state: "",
         pincode: "", phone: "", email: "",
+        targeted_gender: "unisex",
         max_bookings_per_slot: "1",
       });
       setOwnerEmail("");
@@ -135,24 +137,48 @@ export default function AddSalon() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {[
             { key: "name", label: "Salon Name" },
+            {
+              key: "targeted_gender",
+              label: "targeted_gender",
+              type: "select",
+              options: [
+                { value: "male", label: "Male" },
+                { value: "female", label: "Female" },
+                { value: "unisex", label: "Unisex" },
+              ],
+            },
             { key: "phone", label: "Phone" },
             { key: "email", label: "Email", type: "email" },
             { key: "city", label: "City" },
             { key: "state", label: "State" },
             { key: "pincode", label: "Pincode" },
             { key: "max_bookings_per_slot", label: "Max bookings per slot", type: "number" },
-          ].map(({ key, label, type = "text" }) => (
+          ].map(({ key, label, type = "text", options }) => (
             <div key={key} className="flex flex-col gap-1">
               <label className="text-xs text-gray-400">{label}</label>
-              <input
-                type={type}
-                min={type === "number" ? "1" : undefined}
-                step={type === "number" ? "1" : undefined}
-                value={form[key]}
-                onChange={e => setField(key, e.target.value)}
-                placeholder={label}
-                className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
-              />
+              {type === "select" ? (
+                <select
+                  value={form[key]}
+                  onChange={e => setField(key, e.target.value)}
+                  className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white outline-none focus:border-[#18B79B]"
+                >
+                  {options.map(o => (
+                    <option key={o.value} value={o.value} className="bg-[#0f0f0f]">
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  type={type}
+                  min={type === "number" ? "1" : undefined}
+                  step={type === "number" ? "1" : undefined}
+                  value={form[key]}
+                  onChange={e => setField(key, e.target.value)}
+                  placeholder={label}
+                  className="bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
+                />
+              )}
             </div>
           ))}
           <div className="flex flex-col gap-1">

@@ -38,6 +38,13 @@ function parseMaxBookingsPerSlot(value) {
   return Math.floor(n);
 }
 
+const TARGETED_GENDER_VALUES = ["male", "female", "unisex"];
+
+function parseTargetedGender(value) {
+  const v = String(value ?? "").toLowerCase().trim();
+  return TARGETED_GENDER_VALUES.includes(v) ? v : "unisex";
+}
+
 // ─── Storage helpers ─────────────────────────────────────────────────
 export async function uploadFile(path, file) {
   const storageRef = ref(requireStorage(), path);
@@ -251,6 +258,7 @@ export async function addSalon(data, logoFile, coverFile) {
   await runTransaction(_db, async tx => {
     tx.set(docRef, {
       name: data.name,
+      targeted_gender: parseTargetedGender(data.targeted_gender),
       owner_uid: data.owner_uid,
       address: data.address,
       location: toGeoPoint(data.location),
@@ -293,6 +301,7 @@ export async function addSalonFull(data, logoFile, coverFile, galleryFiles = [])
   await runTransaction(_db, async tx => {
     tx.set(docRef, {
       name: data.name,
+      targeted_gender: parseTargetedGender(data.targeted_gender),
       owner_uid: data.owner_uid,
       address: data.address,
       location: toGeoPoint(data.location),
@@ -338,6 +347,7 @@ export async function updateSalon(id, data, logoFile, coverFile, gallery) {
     if (!snap.exists()) throw new Error("Salon not found");
     tx.update(ref_, {
       name: data.name,
+      targeted_gender: parseTargetedGender(data.targeted_gender),
       owner_uid: data.owner_uid,
       address: data.address,
       location: toGeoPoint(data.location),

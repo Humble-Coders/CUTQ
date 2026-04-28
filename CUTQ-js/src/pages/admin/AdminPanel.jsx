@@ -5,6 +5,7 @@ import Categories from "./tabs/Categories";
 import Salons from "./tabs/Salons";
 import HeaderImages from "./tabs/HeaderImages";
 import ExploreSection from "./tabs/ExploreSection";
+import Support from "./tabs/Support";
 import { listenAppConfig, updateBookingFee } from "../../lib/adminFirestore";
 
 const TABS = [
@@ -13,6 +14,7 @@ const TABS = [
   { id: "categories",      label: "Categories" },
   { id: "header_images",   label: "Header Images" },
   { id: "explore_section", label: "Explore Section" },
+  { id: "support",         label: "Support" },
 ];
 
 export default function AdminPanel() {
@@ -83,6 +85,7 @@ export default function AdminPanel() {
           {tab === "categories"      && <Categories />}
           {tab === "header_images"   && <HeaderImages />}
           {tab === "explore_section" && <ExploreSection />}
+          {tab === "support"         && <Support />}
         </main>
       </div>
     </div>

@@ -1,6 +1,6 @@
 const {setGlobalOptions} = require("firebase-functions/v2");
-const {onRequest} = require("firebase-functions/v2/https");
-const {onDocumentCreated} = require("firebase-functions/v2/firestore");
+const {onRequest, onCall, HttpsError} = require("firebase-functions/v2/https");
+const {onDocumentCreated, onDocumentUpdated} = require("firebase-functions/v2/firestore");
 const {defineSecret} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
@@ -374,12 +374,15 @@ exports.validateBookingOnCreate = onDocumentCreated(
 
     try {
       const salonId = booking.salon_id;
-      const serviceId = booking.service_id;
       const slotStart = booking.slot_start?.toDate?.();
       const slotEnd = booking.slot_end?.toDate?.();
 
-      if (!salonId || !serviceId || !slotStart || !slotEnd) {
-        return cancelBooking("INVALID_BOOKING: Missing required fields (salon_id, service_id, slot_start, slot_end)");
+      // Support both new format (services array) and old format (service_id at top level)
+      const isNewFormat = Array.isArray(booking.services) && booking.services.length > 0;
+      const legacyServiceId = booking.service_id;
+
+      if (!salonId || !slotStart || !slotEnd || (!isNewFormat && !legacyServiceId)) {
+        return cancelBooking("INVALID_BOOKING: Missing required fields (salon_id, slot_start, slot_end, services/service_id)");
       }
 
       // 1. Salon must exist and be active
@@ -389,11 +392,22 @@ exports.validateBookingOnCreate = onDocumentCreated(
       }
       const salon = salonSnap.data();
 
-      // 2. Service must exist and be active
-      const serviceSnap = await db.collection("salons").doc(salonId)
-        .collection("services").doc(serviceId).get();
-      if (!serviceSnap.exists || serviceSnap.data().is_active === false) {
-        return cancelBooking("SERVICE_NOT_FOUND: Service not found or inactive");
+      // 2. All services must exist and be active
+      if (isNewFormat) {
+        for (const svc of booking.services) {
+          if (!svc.service_id) continue;
+          const svcSnap = await db.collection("salons").doc(salonId)
+            .collection("services").doc(svc.service_id).get();
+          if (!svcSnap.exists || svcSnap.data().is_active === false) {
+            return cancelBooking(`SERVICE_NOT_FOUND: Service ${svc.service_id} not found or inactive`);
+          }
+        }
+      } else {
+        const serviceSnap = await db.collection("salons").doc(salonId)
+          .collection("services").doc(legacyServiceId).get();
+        if (!serviceSnap.exists || serviceSnap.data().is_active === false) {
+          return cancelBooking("SERVICE_NOT_FOUND: Service not found or inactive");
+        }
       }
 
       // 3. Booking fee snapshot must match current global fee (only checked when fee > 0)
@@ -405,11 +419,11 @@ exports.validateBookingOnCreate = onDocumentCreated(
         }
       }
 
-      // 4. Slot must be at least 30 minutes in the future
+      // 4. Slot must be at least 25 minutes in the future
       const now = new Date();
-      const minTime = new Date(now.getTime() + 30 * 60 * 1000);
+      const minTime = new Date(now.getTime() + 25 * 60 * 1000);
       if (slotStart < minTime) {
-        return cancelBooking("SLOT_TOO_SOON: Slot must be at least 30 minutes from now");
+        return cancelBooking("SLOT_TOO_SOON: Slot must be at least 25 minutes from now");
       }
 
       // 5. Working hours — slot must be within salon open hours on that day.
@@ -477,6 +491,330 @@ exports.validateBookingOnCreate = onDocumentCreated(
     } catch (err) {
       logger.error("Unexpected error during booking validation", {bookingId, err});
       await cancelBooking("INTERNAL_ERROR: " + (err.message || "Unknown error"));
+    }
+  },
+);
+
+// ── Reschedule booking ────────────────────────────────────────────────────────
+// Validates new slot (same 5 checks as onCreate) then updates the booking in-place.
+// If booking was "confirmed", status reverts to "pending" and salon owner is notified.
+// If booking was "pending", status stays "pending" and no notification is sent.
+exports.rescheduleBooking = onCall(async (request) => {
+  const auth = request.auth;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+
+  const {bookingId, newSlotStartMs: rawMs} = request.data || {};
+  const newSlotStartMs = Number(rawMs);
+  if (!bookingId || !newSlotStartMs || isNaN(newSlotStartMs)) {
+    throw new HttpsError("invalid-argument", "bookingId and newSlotStartMs are required.");
+  }
+
+  const db = admin.firestore();
+  const userId = auth.uid;
+
+  // Fetch booking
+  const bookingRef = db.collection("bookings").doc(bookingId);
+  const bookingSnap = await bookingRef.get();
+  if (!bookingSnap.exists) throw new HttpsError("not-found", "Booking not found.");
+  const booking = bookingSnap.data();
+
+  // Ownership check
+  if (booking.user_id !== userId) {
+    throw new HttpsError("permission-denied", "Not your booking.");
+  }
+
+  // Status check — only pending / confirmed can be rescheduled
+  if (booking.status !== "pending" && booking.status !== "confirmed") {
+    throw new HttpsError(
+      "failed-precondition",
+      "Only pending or confirmed bookings can be rescheduled.",
+    );
+  }
+
+  // Compute new end by preserving total duration
+  const oldStartMs = booking.slot_start?.toDate?.()?.getTime?.() ?? 0;
+  const oldEndMs = booking.slot_end?.toDate?.()?.getTime?.() ?? 0;
+  const totalDurationMs = oldEndMs - oldStartMs;
+
+  const newSlotStart = new Date(newSlotStartMs);
+  const newSlotEnd = new Date(newSlotStartMs + totalDurationMs);
+
+  // ── 1. At least 25 min in the future ────────────────────────────────────
+  const now = new Date();
+  const minTime = new Date(now.getTime() + 25 * 60 * 1000);
+  if (newSlotStart < minTime) {
+    throw new HttpsError(
+      "failed-precondition",
+      "SLOT_TOO_SOON: New slot must be at least 25 minutes from now.",
+    );
+  }
+
+  const salonId = booking.salon_id;
+
+  // ── 2. Salon exists and is active ────────────────────────────────────────
+  const salonSnap = await db.collection("salons").doc(salonId).get();
+  if (!salonSnap.exists || salonSnap.data().is_active === false) {
+    throw new HttpsError("failed-precondition", "SALON_NOT_FOUND: Salon not found or inactive.");
+  }
+  const salon = salonSnap.data();
+
+  // ── 3. Working hours ─────────────────────────────────────────────────────
+  const tz = salon.timezone || "Asia/Kolkata";
+  const {weekday: dayKey, totalMinutes: startMin} = getLocalTimeParts(newSlotStart, tz);
+  const {totalMinutes: endMin} = getLocalTimeParts(newSlotEnd, tz);
+  const dayHours = salon.working_hours?.[dayKey];
+  if (!dayHours || dayHours.is_closed === true) {
+    throw new HttpsError("failed-precondition", "SALON_CLOSED: Salon is closed on this day.");
+  }
+  const openMin = parseTimeToMinutes(dayHours.open);
+  const closeMin = parseTimeToMinutes(dayHours.close);
+  if (startMin < openMin || endMin > closeMin) {
+    throw new HttpsError(
+      "failed-precondition",
+      "OUTSIDE_WORKING_HOURS: Slot is outside salon working hours.",
+    );
+  }
+
+  // ── 4. Capacity check ────────────────────────────────────────────────────
+  const dayStart = new Date(newSlotStart);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setDate(dayEnd.getDate() + 1);
+
+  const bookingsSnap = await db.collection("bookings")
+    .where("salon_id", "==", salonId)
+    .where("slot_start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
+    .where("slot_start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
+    .get();
+
+  const maxBookings = salon.max_bookings_per_slot ?? 1;
+  const overlapping = bookingsSnap.docs.filter((doc) => {
+    if (doc.id === bookingId) return false; // exclude the booking being rescheduled
+    const d = doc.data();
+    if (d.status === "cancelled") return false;
+    const bStart = d.slot_start?.toDate?.();
+    const bEnd = d.slot_end?.toDate?.();
+    if (!bStart || !bEnd) return false;
+    return bStart < newSlotEnd && bEnd > newSlotStart;
+  });
+  if (overlapping.length >= maxBookings) {
+    throw new HttpsError("failed-precondition", "SLOT_FULL: This time slot is fully booked.");
+  }
+
+  // ── 5. Blocked slots ─────────────────────────────────────────────────────
+  const blockedSnap = await db.collection("salons").doc(salonId)
+    .collection("blocked_slots")
+    .where("start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
+    .where("start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
+    .get();
+
+  const isBlocked = blockedSnap.docs.some((doc) => {
+    const d = doc.data();
+    const bStart = d.start?.toDate?.();
+    const bEnd = d.end?.toDate?.();
+    if (!bStart || !bEnd) return false;
+    return bStart < newSlotEnd && bEnd > newSlotStart;
+  });
+  if (isBlocked) {
+    throw new HttpsError("failed-precondition", "SLOT_BLOCKED: This time slot is blocked by the salon.");
+  }
+
+  // ── All checks passed — build the update ─────────────────────────────────
+  const wasConfirmed = booking.status === "confirmed";
+  const isNewFormat = Array.isArray(booking.services) && booking.services.length > 0;
+
+  // Recompute per-service windows preserving original durations
+  let updatedServices = null;
+  if (isNewFormat) {
+    let cursor = newSlotStartMs;
+    updatedServices = booking.services.map((svc) => {
+      const durMs = (svc.duration_minutes || 0) * 60_000;
+      const svcStartMs = cursor;
+      const svcEndMs = cursor + durMs;
+      cursor = svcEndMs;
+      return {
+        ...svc,
+        slot_start: admin.firestore.Timestamp.fromMillis(svcStartMs),
+        slot_end: admin.firestore.Timestamp.fromMillis(svcEndMs),
+      };
+    });
+  }
+
+  const updateData = {
+    slot_start: admin.firestore.Timestamp.fromDate(newSlotStart),
+    slot_end: admin.firestore.Timestamp.fromDate(newSlotEnd),
+    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (updatedServices) updateData.services = updatedServices;
+  if (wasConfirmed) updateData.status = "pending";
+
+  await bookingRef.update(updateData);
+  logger.info("Booking rescheduled", {bookingId, userId, wasConfirmed});
+
+  // ── Notify salon owner if booking was confirmed ───────────────────────────
+  if (wasConfirmed) {
+    try {
+      const ownerSnap = await db.collection("salons").doc(salonId).get();
+      const ownerUid = ownerSnap.exists ? ownerSnap.data()?.owner_uid : null;
+      if (ownerUid) {
+        const ownerProfile = await getUserProfile(ownerUid);
+        const ownerToken = ownerProfile?.fcm_token;
+        if (ownerToken) {
+          const slotText = newSlotStart.toISOString().replace("T", " ").slice(0, 16);
+          const svcLabel = isNewFormat ?
+            booking.services.map((s) => s.service_name).join(", ") :
+            (booking.service_name || "appointment");
+          await admin.messaging().send({
+            token: ownerToken,
+            notification: {
+              title: "Booking Rescheduled",
+              body: `A customer rescheduled their ${svcLabel} to ${slotText}.`,
+            },
+            data: {
+              booking_id: String(bookingId),
+              salonId: String(salonId),
+              type: "booking_rescheduled",
+              new_slot_start: String(newSlotStartMs),
+            },
+            android: {
+              priority: "high",
+              notification: {channelId: "cutq_bookings", sound: "default"},
+            },
+            apns: {payload: {aps: {sound: "default", badge: 1}}},
+          });
+          logger.info("Sent reschedule notification to salon", {bookingId, ownerUid});
+        }
+      }
+    } catch (notifErr) {
+      // Non-fatal — the reschedule already succeeded
+      logger.error("Failed to send reschedule notification", {bookingId, err: notifErr});
+    }
+  }
+
+  return {success: true, wasConfirmed};
+});
+
+// ── Booking status notifications ─────────────────────────────────────────────
+// USER notifications:
+//   • pending  → confirmed  : "Booking Confirmed!"
+//   • confirmed → completed : "How was your experience?" (review prompt)
+//   • any      → cancelled (by salon) : "Booking Cancelled"
+//   • any      → cancelled (by user)  : "Booking Cancelled" (confirmation)
+// SALON notifications:
+//   • any      → cancelled (by user)  : "Booking Cancelled by Customer"
+exports.onBookingStatusChanged = onDocumentUpdated(
+  "bookings/{bookingId}",
+  async (event) => {
+    const before = event.data?.before?.data?.() || {};
+    const after = event.data?.after?.data?.() || {};
+
+    // Bail out if status didn't change.
+    if (before.status === after.status) return;
+
+    const bookingId = event.params.bookingId;
+    const userId = after.user_id || "";
+    const salonId = after.salon_id || "";
+    const salonName = after.salon_name || "your salon";
+    const service = after.service_name || "your service";
+
+    // ── Helper: build and send an FCM message ────────────────────────────────
+    async function sendFcm(token, title, body, recipientId, recipientType) {
+      const message = {
+        token,
+        notification: {title, body},
+        data: {
+          booking_id: String(bookingId),
+          type: "booking_status_changed",
+          new_status: String(after.status),
+        },
+        android: {
+          priority: "high",
+          notification: {channelId: "cutq_bookings", sound: "default", priority: "high"},
+        },
+        apns: {payload: {aps: {sound: "default", badge: 1}}},
+      };
+      try {
+        await admin.messaging().send(message);
+        logger.info("Sent booking status notification", {bookingId, recipientId, recipientType, newStatus: after.status});
+      } catch (err) {
+        if (
+          err.code === "messaging/registration-token-not-registered" ||
+          err.code === "messaging/invalid-registration-token"
+        ) {
+          logger.warn("Stale FCM token — removing", {recipientId, recipientType});
+          await admin.firestore().collection("Users").doc(recipientId)
+            .update({fcm_token: admin.firestore.FieldValue.delete()})
+            .catch(() => {});
+        } else {
+          logger.error("Failed to send booking status notification", {bookingId, recipientId, err});
+        }
+      }
+    }
+
+    // ── Determine user notification content ──────────────────────────────────
+    let userTitle = "";
+    let userBody = "";
+    let notifyUser = false;
+    let notifySalon = false;
+
+    if (before.status === "pending" && after.status === "confirmed") {
+      userTitle = "Booking Confirmed!";
+      userBody = `Your ${service} at ${salonName} is confirmed. See you soon!`;
+      notifyUser = true;
+    } else if (before.status === "confirmed" && after.status === "completed") {
+      userTitle = "How was your experience?";
+      userBody = `Your ${service} at ${salonName} is done. Tap to leave a review!`;
+      notifyUser = true;
+    } else if (after.status === "cancelled" && after.cancelled_by === "salon") {
+      const reason = after.cancellation_reason || "No reason provided.";
+      userTitle = "Booking Cancelled";
+      userBody = `${salonName} has cancelled your ${service} appointment. Reason: ${reason}`;
+      notifyUser = true;
+    } else if (after.status === "cancelled" && after.cancelled_by === "user") {
+      userTitle = "Booking Cancelled";
+      userBody = `Your ${service} booking at ${salonName} has been successfully cancelled.`;
+      notifyUser = true;
+      notifySalon = true;
+    } else {
+      return;
+    }
+
+    // ── Notify user ───────────────────────────────────────────────────────────
+    if (notifyUser) {
+      if (!userId) {
+        logger.warn("Booking missing user_id", {bookingId});
+      } else {
+        const userProfile = await getUserProfile(userId);
+        const userToken = userProfile?.fcm_token;
+        if (!userToken) {
+          logger.warn("User has no fcm_token", {bookingId, userId});
+        } else {
+          await sendFcm(userToken, userTitle, userBody, userId, "user");
+        }
+      }
+    }
+
+    // ── Notify salon owner (user cancellation only) ───────────────────────────
+    if (notifySalon) {
+      if (!salonId) {
+        logger.warn("Booking missing salon_id for salon notification", {bookingId});
+        return;
+      }
+      const salonSnap = await admin.firestore().collection("salons").doc(salonId).get();
+      const ownerUid = salonSnap.exists ? salonSnap.data()?.owner_uid : null;
+      if (!ownerUid) {
+        logger.warn("Salon missing owner_uid for cancellation notification", {bookingId, salonId});
+        return;
+      }
+      const ownerProfile = await getUserProfile(ownerUid);
+      const ownerToken = ownerProfile?.fcm_token;
+      if (!ownerToken) {
+        logger.warn("Salon owner has no fcm_token", {bookingId, salonId, ownerUid});
+        return;
+      }
+      const salonTitle = "Booking Cancelled by Customer";
+      const salonBody = `A customer has cancelled their ${service} booking at ${salonName}.`;
+      await sendFcm(ownerToken, salonTitle, salonBody, ownerUid, "salon_owner");
     }
   },
 );

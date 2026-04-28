@@ -97,10 +97,12 @@ Each item in `images[]`:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `name` | string | |
+| `name` | string | Display name; collected on first sign-in |
 | `phone` | string | |
 | `email` | string | |
 | `profile_photo` | string | Often `""` |
+| `gender` | string | `"Male"` \| `"Female"` \| `""`; collected on first sign-in |
+| `dob` | string | `"DD-MM-YYYY"` format; optional, collected on first sign-in |
 | `Role` | string | `"ADMIN"` \| `"SALONOWNER"` \| `"USER"` |
 | `isEnabled` | boolean | Must be `true` for admin panel login |
 | `created_at` | timestamp | Set on create |
@@ -118,7 +120,6 @@ Each item in `images[]`:
 | Field | Type | Notes |
 |-------|------|-------|
 | `name` | string | Salon display name |
-| `targeted_gender` | string | `"male"` \| `"female"` \| `"unisex"` — who the salon primarily serves |
 | `owner_uid` | string | Firebase Auth UID — links to `Users/{owner_uid}` |
 | `address` | string | |
 | `location` | GeoPoint \| null | Derived from lat/lng; `null` if invalid or missing |
@@ -135,6 +136,7 @@ Each item in `images[]`:
 | `max_bookings_per_slot` | number | Maximum concurrent bookings allowed per time slot; integer ≥ `1`; set from admin **Add Salon** / **Edit Salon** |
 | `avg_rating` | number | `0` on create; updated by booking/review logic, not admin |
 | `review_count` | number | `0` on create; updated by booking/review logic, not admin |
+| `targeted_gender` | string | `"male"` \| `"female"` \| `"unisex"`; default `"unisex"` |
 | `is_active` | boolean | |
 | `is_verified` | boolean | |
 | `created_at` | timestamp | Set on create |

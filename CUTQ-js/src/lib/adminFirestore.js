@@ -1,7 +1,7 @@
 import {
-  collection, doc, updateDoc, deleteDoc,
+  collection, doc, updateDoc, deleteDoc, setDoc,
   getDocs, query, orderBy, serverTimestamp,
-  runTransaction, onSnapshot, GeoPoint,
+  runTransaction, onSnapshot, GeoPoint, getDoc,
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 import { db, storage } from "../firebase";
@@ -482,4 +482,54 @@ export async function updateExploreSection(id, data, imageFile) {
 export async function deleteExploreSection(id) {
   await deleteFile(`explore_section/${id}/image.jpg`);
   await deleteDoc(doc(requireDb(), "explore_section", id));
+}
+// ─── Support Collection ──────────────────────────────────────────────
+// All support data lives in collection `support` with fixed document IDs:
+//   support/contact            → email, phone, support_hours
+//   support/faqs               → items: [{id, question, answer, order}]
+//   support/privacy_policy_user   → html: string
+//   support/privacy_policy_salon  → html: string
+
+function supportDocRef(docId) {
+  return doc(requireDb(), "support", docId);
+}
+
+// ── Contact ──────────────────────────────────────────────────────────
+export function listenSupportContact(callback) {
+  if (!db) { callback({ email: "", phone: "", support_hours: "" }); return () => {}; }
+  return onSnapshot(supportDocRef("contact"), snap => {
+    callback(snap.exists() ? snap.data() : { email: "", phone: "", support_hours: "" });
+  });
+}
+
+export async function saveSupportContact({ email, phone, support_hours }) {
+  await setDoc(supportDocRef("contact"), { email, phone, support_hours, updated_at: serverTimestamp() }, { merge: true });
+}
+
+// ── FAQs ─────────────────────────────────────────────────────────────
+export function listenSupportFaqs(callback) {
+  if (!db) { callback({ items: [] }); return () => {}; }
+  return onSnapshot(supportDocRef("faqs"), snap => {
+    callback(snap.exists() ? snap.data() : { items: [] });
+  });
+}
+
+export async function saveSupportFaqs(items) {
+  // items: [{ id, question, answer, order }]
+  await setDoc(supportDocRef("faqs"), { items, updated_at: serverTimestamp() }, { merge: true });
+}
+
+// ── Privacy Policy ────────────────────────────────────────────────────
+export function listenPrivacyPolicy(type, callback) {
+  // type: "user" | "salon"
+  const id = type === "salon" ? "privacy_policy_salon" : "privacy_policy_user";
+  if (!db) { callback({ html: "" }); return () => {}; }
+  return onSnapshot(supportDocRef(id), snap => {
+    callback(snap.exists() ? snap.data() : { html: "" });
+  });
+}
+
+export async function savePrivacyPolicy(type, html) {
+  const id = type === "salon" ? "privacy_policy_salon" : "privacy_policy_user";
+  await setDoc(supportDocRef(id), { html, updated_at: serverTimestamp() }, { merge: true });
 }

@@ -48,8 +48,18 @@ function parseTargetedGender(value) {
 // ─── Storage helpers ─────────────────────────────────────────────────
 export async function uploadFile(path, file) {
   const storageRef = ref(requireStorage(), path);
-  await uploadBytes(storageRef, file);
-  return getDownloadURL(storageRef);
+  try {
+    await uploadBytes(storageRef, file);
+    return await getDownloadURL(storageRef);
+  } catch (err) {
+    if (err?.code === "storage/unauthorized") {
+      throw new Error("Image upload was blocked by Storage permissions. Check Firebase Storage rules.");
+    }
+    if (err?.code === "storage/retry-limit-exceeded" || err?.code === "storage/canceled") {
+      throw new Error("Image upload failed (network/timeout). Please check your connection and try again.");
+    }
+    throw new Error(`Image upload failed: ${err?.message || err?.code || "unknown error"}`);
+  }
 }
 
 export async function deleteFile(path) {

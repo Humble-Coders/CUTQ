@@ -79,6 +79,9 @@ export default function AddSalon() {
     }
     setLoading(true);
     try {
+      if (!auth?.currentUser) {
+        throw new Error("Your session has expired. Please sign in again.");
+      }
       setCreatingOwner(true);
       const idToken = await getIdToken(auth.currentUser);
       const fnRes = await fetch(
@@ -92,10 +95,20 @@ export default function AddSalon() {
           body: JSON.stringify({ data: { email: ownerEmail.trim(), name: ownerName.trim(), phone: ownerPhone.trim() } }),
         }
       );
-      const fnJson = await fnRes.json();
-      if (fnJson.error) throw new Error(fnJson.error.message || "createSalonOwner failed");
+      // The function may return a non-JSON body on an unexpected crash — read text
+      // first so we can surface a useful message instead of a JSON parse error.
+      const raw = await fnRes.text();
+      let fnJson = {};
+      try {
+        fnJson = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(`Owner account service error (HTTP ${fnRes.status}). ${raw.slice(0, 200) || "Please try again."}`);
+      }
+      if (fnJson.error) throw new Error(fnJson.error.message || `Could not create owner account (HTTP ${fnRes.status}).`);
+      if (!fnRes.ok) throw new Error(`Owner account service failed (HTTP ${fnRes.status}).`);
       const ownerUid = fnJson.result?.uid;
-      if (!ownerUid) throw new Error("createSalonOwner did not return uid");
+      if (!ownerUid) throw new Error("Owner account was not created (no UID returned).");
+      setCreatingOwner(false);
 
       // all file uploads (logo + cover + gallery) happen in parallel — single updateDoc
       const id = await addSalonFull(
@@ -105,7 +118,12 @@ export default function AddSalon() {
         galleryFiles,
       );
 
-      toast.success(`Salon added! ID: ${id}`);
+      const ownerNote = fnJson.result?.isExistingOwner
+        ? " (linked to existing owner account)"
+        : fnJson.result?.emailSent === false
+          ? " (owner created — welcome email could not be sent)"
+          : "";
+      toast.success(`Salon added!${ownerNote} ID: ${id}`);
       setForm({
         name: "", owner_uid: "", address: "", city: "", state: "",
         pincode: "", phone: "", email: "",
@@ -122,7 +140,14 @@ export default function AddSalon() {
       setGalleryFiles([]);
     } catch (err) {
       console.error(err);
-      toast.error("Failed to add salon");
+      // Surface the real reason so the admin knows what to fix, instead of a
+      // generic "Failed to add salon".
+      const msg =
+        err?.message ||
+        err?.code ||
+        (typeof err === "string" ? err : "") ||
+        "Something went wrong while adding the salon.";
+      toast.error(`Failed to add salon: ${msg}`);
     } finally {
       setCreatingOwner(false);
       setLoading(false);

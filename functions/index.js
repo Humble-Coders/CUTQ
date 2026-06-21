@@ -150,94 +150,130 @@ exports.createSalonOwner = onRequest(
       return;
     }
 
-    // Verify Firebase ID token
-    const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (!idToken) {
-      res.status(401).json({error: {status: "UNAUTHENTICATED", message: "Missing auth token."}});
-      return;
-    }
-
-    let decoded;
     try {
-      decoded = await admin.auth().verifyIdToken(idToken);
-    } catch (e) {
-      res.status(401).json({error: {status: "UNAUTHENTICATED", message: "Invalid auth token."}});
-      return;
-    }
+      // Verify Firebase ID token
+      const authHeader = req.headers.authorization || "";
+      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (!idToken) {
+        res.status(401).json({error: {status: "UNAUTHENTICATED", message: "Missing auth token."}});
+        return;
+      }
 
-    // Check ADMIN access
-    const profile = await getUserProfile(decoded.uid);
-    if (!profile || profile.Role !== "ADMIN" || profile.isEnabled !== true) {
-      res.status(403).json({error: {status: "PERMISSION_DENIED", message: "Admin access required."}});
-      return;
-    }
+      let decoded;
+      try {
+        decoded = await admin.auth().verifyIdToken(idToken);
+      } catch (e) {
+        res.status(401).json({error: {status: "UNAUTHENTICATED", message: "Invalid auth token. Please sign out and sign in again."}});
+        return;
+      }
 
-    const data = (req.body && req.body.data) || {};
-    const email = String(data.email || "").trim().toLowerCase();
-    const name = String(data.name || "").trim();
-    const phone = String(data.phone || "").trim();
+      // Check ADMIN access
+      const profile = await getUserProfile(decoded.uid);
+      if (!profile || profile.Role !== "ADMIN" || profile.isEnabled !== true) {
+        res.status(403).json({error: {status: "PERMISSION_DENIED", message: "Admin access required."}});
+        return;
+      }
 
-    if (!email || !email.includes("@")) {
-      res.status(400).json({error: {status: "INVALID_ARGUMENT", message: "Valid email is required."}});
-      return;
-    }
+      const data = (req.body && req.body.data) || {};
+      const email = String(data.email || "").trim().toLowerCase();
+      const name = String(data.name || "").trim();
+      const phone = String(data.phone || "").trim();
 
-    const smtpUser = SMTP_USER.value();
-    const smtpPass = SMTP_PASS.value();
+      if (!email || !email.includes("@")) {
+        res.status(400).json({error: {status: "INVALID_ARGUMENT", message: "A valid owner email is required."}});
+        return;
+      }
 
-    const password = randomPassword(8);
+      // ── Create (or reuse) the owner account ──────────────────────────────────
+      // Admins legitimately add multiple salons for the same owner. If the account
+      // already exists, reuse it instead of failing — we just skip sending a new
+      // password email so we never reset an existing owner's password.
+      let uid;
+      let isExistingOwner = false;
+      const password = randomPassword(8);
 
-    let userRecord;
-    try {
-      userRecord = await admin.auth().createUser({
-        email,
-        password,
-        displayName: name || undefined,
-        disabled: false,
-      });
-    } catch (err) {
-      logger.error("createUser failed", err);
-      res.status(409).json({error: {status: "ALREADY_EXISTS", message: "User already exists or email invalid."}});
-      return;
-    }
-
-    const uid = userRecord.uid;
-
-    // Write Users doc + send email in parallel
-    await Promise.all([
-      admin.firestore().collection("Users").doc(uid).set(
-        {
-          name: name || "",
-          phone: phone || "",
+      try {
+        const userRecord = await admin.auth().createUser({
           email,
-          profile_photo: "",
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-          Role: "SALONOWNER",
-          isEnabled: true,
-        },
-        {merge: true},
-      ),
-      nodemailer.createTransport({
-        host: "smtp.gmail.com",
-        port: 465,
-        secure: true,
-        auth: {user: smtpUser, pass: smtpPass},
-      }).sendMail({
-        from: `"CUTQ Salon" <${smtpUser}>`,
-        to: email,
-        subject: "Your Salon Owner Account — CUTQ",
-        text:
-          `Hello ${name || "there"},\n\n` +
-          "Your salon owner account has been created.\n\n" +
-          `Email: ${email}\n` +
-          `Temporary password: ${password}\n\n` +
-          "Please sign in and change your password.\n",
-        html: buildEmailHtml(name, email, password),
-      }),
-    ]);
+          password,
+          displayName: name || undefined,
+          disabled: false,
+        });
+        uid = userRecord.uid;
+      } catch (err) {
+        if (err.code === "auth/email-already-exists") {
+          // Reuse the existing account.
+          const existing = await admin.auth().getUserByEmail(email);
+          uid = existing.uid;
+          isExistingOwner = true;
+        } else if (err.code === "auth/invalid-email") {
+          res.status(400).json({error: {status: "INVALID_ARGUMENT", message: "The owner email address is not valid."}});
+          return;
+        } else {
+          logger.error("createUser failed", err);
+          res.status(500).json({error: {status: "INTERNAL", message: `Could not create owner account: ${err.message || "unknown error"}`}});
+          return;
+        }
+      }
 
-    res.status(200).json({result: {uid, email}});
+      // Ensure the Users profile exists / is marked as a salon owner.
+      // For a brand-new account we set created_at; for an existing one we only merge
+      // the role/contact fields so we don't clobber their existing profile.
+      const profileData = {
+        email,
+        Role: "SALONOWNER",
+        isEnabled: true,
+      };
+      if (name) profileData.name = name;
+      if (phone) profileData.phone = phone;
+      if (!isExistingOwner) {
+        profileData.profile_photo = "";
+        profileData.created_at = admin.firestore.FieldValue.serverTimestamp();
+      }
+      await admin.firestore().collection("Users").doc(uid).set(profileData, {merge: true});
+
+      // ── Send the welcome email — NON-FATAL ───────────────────────────────────
+      // Email delivery must never block salon creation: the account already exists
+      // at this point, so a transient SMTP error shouldn't fail the whole request
+      // (and force an "already exists" failure on retry). We only email brand-new
+      // owners, since we never reset an existing owner's password.
+      let emailSent = false;
+      if (!isExistingOwner) {
+        try {
+          const smtpUser = SMTP_USER.value();
+          const smtpPass = SMTP_PASS.value();
+          if (!smtpUser || !smtpPass) {
+            logger.warn("SMTP credentials not configured — skipping welcome email", {uid});
+          } else {
+            await nodemailer.createTransport({
+              host: "smtp.gmail.com",
+              port: 465,
+              secure: true,
+              auth: {user: smtpUser, pass: smtpPass},
+            }).sendMail({
+              from: `"CUTQ Salon" <${smtpUser}>`,
+              to: email,
+              subject: "Your Salon Owner Account — CUTQ",
+              text:
+                `Hello ${name || "there"},\n\n` +
+                "Your salon owner account has been created.\n\n" +
+                `Email: ${email}\n` +
+                `Temporary password: ${password}\n\n` +
+                "Please sign in and change your password.\n",
+              html: buildEmailHtml(name, email, password),
+            });
+            emailSent = true;
+          }
+        } catch (mailErr) {
+          logger.error("Failed to send welcome email (non-fatal)", {uid, err: mailErr});
+        }
+      }
+
+      res.status(200).json({result: {uid, email, isExistingOwner, emailSent}});
+    } catch (err) {
+      logger.error("createSalonOwner unexpected error", err);
+      res.status(500).json({error: {status: "INTERNAL", message: `Unexpected server error: ${err.message || "unknown error"}`}});
+    }
   },
 );
 
@@ -816,5 +852,104 @@ exports.onBookingStatusChanged = onDocumentUpdated(
       const salonBody = `A customer has cancelled their ${service} booking at ${salonName}.`;
       await sendFcm(ownerToken, salonTitle, salonBody, ownerUid, "salon_owner");
     }
+  },
+);
+
+// ── Review aggregation: salon ─────────────────────────────────────────────────
+// On every new salon_review: recalculate avg_rating + review_count on the salon
+// using an incremental transaction, then notify the reviewer.
+exports.onSalonReviewCreated = onDocumentCreated(
+  "salon_reviews/{reviewId}",
+  async (event) => {
+    const review = event.data?.data?.() || {};
+    const {salon_id: salonId, user_id: userId, rating} = review;
+
+    if (!salonId || typeof rating !== "number") {
+      logger.warn("onSalonReviewCreated: missing salon_id or rating", {reviewId: event.params.reviewId});
+      return;
+    }
+
+    const db = admin.firestore();
+    const salonRef = db.collection("salons").doc(salonId);
+
+    // Incremental avg inside a transaction — safe against concurrent reviews.
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(salonRef);
+      if (!snap.exists) return;
+      const data = snap.data();
+      const oldCount = data.review_count || 0;
+      const oldAvg = data.avg_rating || 0;
+      const newCount = oldCount + 1;
+      const newAvg = (oldAvg * oldCount + rating) / newCount;
+      tx.update(salonRef, {
+        avg_rating: Math.round(newAvg * 10) / 10,
+        review_count: newCount,
+      });
+    });
+
+    logger.info("Updated salon rating", {salonId, rating});
+
+    // Notify reviewer
+    if (!userId) return;
+    try {
+      const userProfile = await getUserProfile(userId);
+      const token = userProfile?.fcm_token;
+      if (!token) return;
+
+      await admin.messaging().send({
+        token,
+        notification: {
+          title: "Review Submitted!",
+          body: "Thank you for your feedback. Your review helps others discover great salons.",
+        },
+        data: {
+          type: "review_submitted",
+          salon_id: String(salonId),
+        },
+        android: {
+          priority: "high",
+          notification: {channelId: "cutq_bookings", sound: "default"},
+        },
+        apns: {payload: {aps: {sound: "default"}}},
+      });
+      logger.info("Sent review confirmation to user", {userId, salonId});
+    } catch (err) {
+      logger.error("Failed to send review confirmation", {userId, salonId, err});
+    }
+  },
+);
+
+// ── Review aggregation: service ───────────────────────────────────────────────
+// On every new service_review: recalculate avg_rating + review_count on the
+// service sub-document (salons/{salonId}/services/{serviceId}).
+exports.onServiceReviewCreated = onDocumentCreated(
+  "service_reviews/{reviewId}",
+  async (event) => {
+    const review = event.data?.data?.() || {};
+    const {salon_id: salonId, service_id: serviceId, rating} = review;
+
+    if (!salonId || !serviceId || typeof rating !== "number") {
+      logger.warn("onServiceReviewCreated: missing required fields", {reviewId: event.params.reviewId});
+      return;
+    }
+
+    const db = admin.firestore();
+    const serviceRef = db.collection("salons").doc(salonId).collection("services").doc(serviceId);
+
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(serviceRef);
+      if (!snap.exists) return;
+      const data = snap.data();
+      const oldCount = data.review_count || 0;
+      const oldAvg = data.avg_rating || 0;
+      const newCount = oldCount + 1;
+      const newAvg = (oldAvg * oldCount + rating) / newCount;
+      tx.update(serviceRef, {
+        avg_rating: Math.round(newAvg * 10) / 10,
+        review_count: newCount,
+      });
+    });
+
+    logger.info("Updated service rating", {salonId, serviceId, rating});
   },
 );

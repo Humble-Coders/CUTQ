@@ -1,10 +1,11 @@
 import {
   collection, doc, updateDoc, deleteDoc, setDoc,
   getDocs, query, orderBy, serverTimestamp,
-  runTransaction, onSnapshot, GeoPoint, getDoc,
+  runTransaction, onSnapshot, GeoPoint,
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
-import { db, storage } from "../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, storage, functions } from "../firebase";
 
 function requireDb() {
   if (!db) throw new Error("Firebase is not configured (missing VITE_FIREBASE_* env vars).");
@@ -46,10 +47,18 @@ function parseTargetedGender(value) {
 }
 
 // ─── Storage helpers ─────────────────────────────────────────────────
+// Long-lived cache. Safe because getDownloadURL() returns a token'd URL that
+// changes whenever the file is overwritten, so consumers never serve a stale
+// image from cache after an update.
+const IMAGE_CACHE_CONTROL = "public, max-age=31536000";
+
 export async function uploadFile(path, file) {
   const storageRef = ref(requireStorage(), path);
   try {
-    await uploadBytes(storageRef, file);
+    await uploadBytes(storageRef, file, {
+      contentType: file?.type || "image/jpeg",
+      cacheControl: IMAGE_CACHE_CONTROL,
+    });
     return await getDownloadURL(storageRef);
   } catch (err) {
     if (err?.code === "storage/unauthorized") {
@@ -68,6 +77,31 @@ export async function deleteFile(path) {
   } catch {
     // ignore missing objects / permission differences
   }
+}
+
+// Download a searched royalty-free image server-side and re-host it to `path`.
+// Iconify SVGs are rasterized to PNG by the Cloud Function (the app can't render
+// SVG). Returns the Storage download URL.
+async function attachStockImage(path, selection) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "attachRemoteImage");
+  const res = await call({
+    source: selection.source,
+    storagePath: path,
+    iconId: selection.iconId,
+    color: selection.color,
+    photoUrl: selection.photoUrl,
+  });
+  return res.data.url;
+}
+
+// Resolve an image input to a Storage download URL. The input is either a File
+// (manual upload) or a stock-image selection ({ __stock: true, ... }) from the
+// StockImagePicker. Returns null when there's no input.
+async function resolveImage(path, input) {
+  if (!input) return null;
+  if (input.__stock) return attachStockImage(path, input);
+  return uploadFile(path, input);
 }
 
 // ─── App Config (global booking fee) ────────────────────────────────
@@ -127,10 +161,8 @@ export async function addCategory(data, iconFile) {
       updated_at: serverTimestamp(),
     });
   });
-  if (iconFile) {
-    const url = await uploadFile(`service_categories/${docRef.id}/icon.jpg`, iconFile);
-    await updateDoc(docRef, { icon_url: url });
-  }
+  const iconUrl = await resolveImage(`service_categories/${docRef.id}/icon.jpg`, iconFile);
+  if (iconUrl) await updateDoc(docRef, { icon_url: iconUrl });
   return docRef.id;
 }
 
@@ -148,10 +180,8 @@ export async function updateCategory(id, data, iconFile) {
     };
     tx.update(ref_, updates);
   });
-  if (iconFile) {
-    const url = await uploadFile(`service_categories/${id}/icon.jpg`, iconFile);
-    await updateDoc(ref_, { icon_url: url });
-  }
+  const iconUrl = await resolveImage(`service_categories/${id}/icon.jpg`, iconFile);
+  if (iconUrl) await updateDoc(ref_, { icon_url: iconUrl });
 }
 
 export async function toggleCategory(id, is_active) {
@@ -205,10 +235,10 @@ export async function addSubcategory(data, iconFile, bannerFile) {
     });
   });
   const updates = {};
-  if (iconFile)
-    updates.icon_url = await uploadFile(`service_subcategories/${docRef.id}/icon.jpg`, iconFile);
-  if (bannerFile)
-    updates.banner_url = await uploadFile(`service_subcategories/${docRef.id}/banner.jpg`, bannerFile);
+  const iconUrl = await resolveImage(`service_subcategories/${docRef.id}/icon.jpg`, iconFile);
+  if (iconUrl) updates.icon_url = iconUrl;
+  const bannerUrl = await resolveImage(`service_subcategories/${docRef.id}/banner.jpg`, bannerFile);
+  if (bannerUrl) updates.banner_url = bannerUrl;
   if (Object.keys(updates).length) await updateDoc(docRef, updates);
   return docRef.id;
 }
@@ -228,10 +258,10 @@ export async function updateSubcategory(id, data, iconFile, bannerFile) {
     });
   });
   const updates = {};
-  if (iconFile)
-    updates.icon_url = await uploadFile(`service_subcategories/${id}/icon.jpg`, iconFile);
-  if (bannerFile)
-    updates.banner_url = await uploadFile(`service_subcategories/${id}/banner.jpg`, bannerFile);
+  const iconUrl = await resolveImage(`service_subcategories/${id}/icon.jpg`, iconFile);
+  if (iconUrl) updates.icon_url = iconUrl;
+  const bannerUrl = await resolveImage(`service_subcategories/${id}/banner.jpg`, bannerFile);
+  if (bannerUrl) updates.banner_url = bannerUrl;
   if (Object.keys(updates).length) await updateDoc(ref_, updates);
 }
 

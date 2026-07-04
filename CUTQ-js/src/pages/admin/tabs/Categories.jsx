@@ -1,22 +1,50 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { toast } from "sonner";
-import { PlusIcon, Pencil, Trash2, ChevronDown, ChevronRight, ToggleLeft, ToggleRight } from "lucide-react";
+import { PlusIcon, Pencil, Trash2, ChevronDown, ChevronRight, ToggleLeft, ToggleRight, Search } from "lucide-react";
 import {
   fetchCategories, addCategory, updateCategory, toggleCategory, deleteCategory,
   fetchSubcategories, addSubcategory, updateSubcategory, toggleSubcategory, deleteSubcategory,
 } from "../../../lib/adminFirestore";
+import StockImagePicker from "../../../components/StockImagePicker";
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
 
-function ImagePicker({ label, onChange, preview }) {
+function ImagePicker({ label, kind = "icon", value, onChange, preview }) {
+  const [showPicker, setShowPicker] = useState(false);
+
+  const filePreview = useMemo(
+    () => (value instanceof File ? URL.createObjectURL(value) : null),
+    [value]
+  );
+  useEffect(() => () => { if (filePreview) URL.revokeObjectURL(filePreview); }, [filePreview]);
+
+  const shownPreview = value?.__stock ? value.previewUrl : (filePreview || preview);
+
   return (
     <div className="flex flex-col gap-1">
       <label className="text-xs text-gray-400">{label}</label>
-      <div className="flex items-center gap-3">
-        {preview && <img src={preview} className="w-10 h-10 rounded object-cover border border-white/10" />}
+      <div className="flex items-center gap-3 flex-wrap">
+        {shownPreview && (
+          <img src={shownPreview} className="w-10 h-10 rounded object-contain bg-white/5 border border-white/10" />
+        )}
         <input type="file" accept="image/*" onChange={e => onChange(e.target.files[0])}
           className="text-xs text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-[#18B79B] file:text-white file:cursor-pointer" />
+        <button type="button" onClick={() => setShowPicker(true)}
+          className="flex items-center gap-1 px-2.5 py-1 text-xs rounded border border-white/10 text-gray-300 hover:bg-white/5">
+          <Search size={12} /> Search {kind === "banner" ? "photo" : "icon"}
+        </button>
+        {value?.__stock && (
+          <button type="button" onClick={() => onChange(null)}
+            className="text-xs text-gray-500 hover:text-red-400">clear</button>
+        )}
       </div>
+      {showPicker && (
+        <StockImagePicker
+          kind={kind}
+          onClose={() => setShowPicker(false)}
+          onSelect={(sel) => { onChange(sel); setShowPicker(false); }}
+        />
+      )}
     </div>
   );
 }
@@ -43,7 +71,7 @@ function CategoryForm({ initial, onSave, onCancel, loading }) {
         <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)} className="accent-[#18B79B]" />
         Active
       </label>
-      <ImagePicker label="Icon" onChange={setIcon} preview={initial?.icon_url} />
+      <ImagePicker label="Icon" kind="icon" value={icon} onChange={setIcon} preview={initial?.icon_url} />
       <div className="flex gap-2 justify-end">
         <button type="button" onClick={onCancel} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">Cancel</button>
         <button type="submit" disabled={loading} className="px-4 py-1.5 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-50">
@@ -82,8 +110,8 @@ function SubcategoryForm({ categories, initial, onSave, onCancel, loading }) {
         <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)} className="accent-[#18B79B]" />
         Active
       </label>
-      <ImagePicker label="Icon" onChange={setIcon} preview={initial?.icon_url} />
-      <ImagePicker label="Banner" onChange={setBanner} preview={initial?.banner_url} />
+      <ImagePicker label="Icon" kind="icon" value={icon} onChange={setIcon} preview={initial?.icon_url} />
+      <ImagePicker label="Banner" kind="banner" value={banner} onChange={setBanner} preview={initial?.banner_url} />
       <div className="flex gap-2 justify-end">
         <button type="button" onClick={onCancel} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">Cancel</button>
         <button type="submit" disabled={loading} className="px-4 py-1.5 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-50">

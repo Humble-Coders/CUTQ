@@ -6,9 +6,11 @@ const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
+const sharp = require("sharp");
 
 const SMTP_USER = defineSecret("SMTP_USER");
 const SMTP_PASS = defineSecret("SMTP_PASS");
+const PEXELS_API_KEY = defineSecret("PEXELS_API_KEY");
 
 setGlobalOptions({maxInstances: 10});
 
@@ -953,3 +955,131 @@ exports.onServiceReviewCreated = onDocumentCreated(
     logger.info("Updated service rating", {salonId, serviceId, rating});
   },
 );
+
+// ── Stock image search & attach (admin panel) ──────────────────────────────────
+//
+// Two callables used by the admin Categories tab so an admin can search for an
+// image by keyword and attach it to a category/subcategory instead of uploading:
+//   - searchStockPhotos: proxies Pexels (keeps the API key server-side).
+//   - attachRemoteImage: downloads the chosen image server-side (no CORS),
+//       rasterizes Iconify SVGs to PNG (the mobile app can't render SVG), and
+//       uploads it to the same Storage path the manual upload flow uses.
+// Iconify icon search is done directly from the browser (keyless, CORS-enabled).
+
+const IMAGE_CACHE_CONTROL = "public, max-age=31536000";
+// Only these Storage paths may be written by attachRemoteImage (prevents an
+// authenticated admin from being tricked into overwriting arbitrary objects).
+const ALLOWED_IMAGE_PATH = /^service_(categories|subcategories)\/[A-Za-z0-9_-]+\/(icon|banner)\.jpg$/;
+const ICON_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+async function requireAdmin(auth) {
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+  const profile = await getUserProfile(auth.uid);
+  const role = String(profile?.Role || profile?.role || "").toUpperCase();
+  if (role !== "ADMIN" || profile?.isEnabled !== true) {
+    throw new HttpsError("permission-denied", "Admin access required.");
+  }
+  return profile;
+}
+
+exports.searchStockPhotos = onCall({secrets: [PEXELS_API_KEY]}, async (request) => {
+  await requireAdmin(request.auth);
+
+  const {query, page = 1, perPage = 24} = request.data || {};
+  if (!query || !String(query).trim()) {
+    throw new HttpsError("invalid-argument", "A search query is required.");
+  }
+  const url = new URL("https://api.pexels.com/v1/search");
+  url.searchParams.set("query", String(query).trim());
+  url.searchParams.set("per_page", String(Math.min(Math.max(Number(perPage) || 24, 1), 80)));
+  url.searchParams.set("page", String(Math.max(Number(page) || 1, 1)));
+  url.searchParams.set("orientation", "landscape");
+
+  const res = await fetch(url, {headers: {Authorization: PEXELS_API_KEY.value()}});
+  if (!res.ok) {
+    logger.error("Pexels search failed", {status: res.status});
+    throw new HttpsError("internal", `Image search failed (HTTP ${res.status}).`);
+  }
+  const data = await res.json();
+  const photos = (data.photos || []).map((p) => ({
+    id: p.id,
+    thumb: p.src?.tiny || p.src?.small,
+    preview: p.src?.medium || p.src?.large,
+    // src to actually store (validated by host on attach)
+    full: p.src?.large2x || p.src?.large || p.src?.original,
+    photographer: p.photographer,
+    alt: p.alt || "",
+  }));
+  return {photos, page: Number(page) || 1, totalResults: data.total_results || 0};
+});
+
+exports.attachRemoteImage = onCall(async (request) => {
+  await requireAdmin(request.auth);
+
+  const {source, storagePath, iconId, color, photoUrl} = request.data || {};
+  if (!ALLOWED_IMAGE_PATH.test(String(storagePath || ""))) {
+    throw new HttpsError("invalid-argument", "Invalid storage path.");
+  }
+
+  let buffer;
+  let contentType;
+
+  if (source === "iconify") {
+    if (!ICON_ID_RE.test(String(iconId || ""))) {
+      throw new HttpsError("invalid-argument", "Invalid icon id.");
+    }
+    const hex = HEX_COLOR_RE.test(String(color || "")) ? String(color) : "#111827";
+    const [prefix, name] = String(iconId).split(":");
+    const iconUrl = new URL(`https://api.iconify.design/${prefix}/${name}.svg`);
+    iconUrl.searchParams.set("width", "256");
+    iconUrl.searchParams.set("height", "256");
+    iconUrl.searchParams.set("color", hex);
+
+    const res = await fetch(iconUrl);
+    if (!res.ok) throw new HttpsError("internal", `Icon fetch failed (HTTP ${res.status}).`);
+    const svg = Buffer.from(await res.arrayBuffer());
+    // Rasterize to a transparent 256x256 PNG — the app renders raster, not SVG.
+    buffer = await sharp(svg)
+      .resize(256, 256, {fit: "contain", background: {r: 0, g: 0, b: 0, alpha: 0}})
+      .png()
+      .toBuffer();
+    contentType = "image/png";
+  } else if (source === "pexels") {
+    let host;
+    try {
+      host = new URL(String(photoUrl)).host;
+    } catch {
+      throw new HttpsError("invalid-argument", "Invalid photo URL.");
+    }
+    if (host !== "images.pexels.com") {
+      throw new HttpsError("invalid-argument", "Photo URL must be a Pexels image.");
+    }
+    const res = await fetch(photoUrl);
+    if (!res.ok) throw new HttpsError("internal", `Photo fetch failed (HTTP ${res.status}).`);
+    // Normalize to a reasonably sized JPEG to keep Storage light.
+    const original = Buffer.from(await res.arrayBuffer());
+    buffer = await sharp(original)
+      .resize(1600, 1600, {fit: "inside", withoutEnlargement: true})
+      .jpeg({quality: 82})
+      .toBuffer();
+    contentType = "image/jpeg";
+  } else {
+    throw new HttpsError("invalid-argument", "Unknown image source.");
+  }
+
+  const bucket = admin.storage().bucket();
+  const token = crypto.randomUUID();
+  await bucket.file(storagePath).save(buffer, {
+    resumable: false,
+    metadata: {
+      contentType,
+      cacheControl: IMAGE_CACHE_CONTROL,
+      metadata: {firebaseStorageDownloadTokens: token},
+    },
+  });
+  const url =
+    `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
+    `${encodeURIComponent(storagePath)}?alt=media&token=${token}`;
+  return {url};
+});

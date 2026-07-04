@@ -6,41 +6,32 @@ import { toast } from "sonner";
 import { X, Search, Loader2, Check } from "lucide-react";
 
 /*
- * Search-and-pick modal for attaching a royalty-free image without uploading.
+ * Search-and-pick modal for attaching a royalty-free PHOTO to a category or
+ * subcategory (icon or banner) instead of uploading a file.
  *
- *   kind="icon"   -> Iconify open-source icon search (keyless, done in-browser).
- *                    Returns { __stock, source:"iconify", iconId, color, previewUrl }.
- *   kind="banner" -> Pexels photo search via the searchStockPhotos Cloud Function
- *                    (keeps the API key server-side).
- *                    Returns { __stock, source:"pexels", photoUrl, previewUrl, photographer }.
+ * Category/subcategory tiles render as large (140dp) images in the app, so real
+ * photos look far better than flat icons. Search runs through the
+ * searchStockPhotos Cloud Function (Pexels; API key stays server-side).
  *
- * The picker only chooses — the actual download + re-host to Firebase Storage is
- * done later by the attachRemoteImage Cloud Function (see adminFirestore.js), so
- * that it lands on the correct salon/category Storage path.
+ * onSelect returns: { __stock, source:"pexels", photoUrl, previewUrl, photographer }
+ * The actual download + square/wide crop + re-host happens later in
+ * attachRemoteImage (server-side), based on the target Storage path.
  */
-
-const ICON_COLORS = [
-  { label: "Charcoal", hex: "#111827" },
-  { label: "Teal", hex: "#18B79B" },
-  { label: "Slate", hex: "#475569" },
-];
-
-function iconSvgUrl(iconId, hex, size = 40) {
-  const [prefix, name] = iconId.split(":");
-  return `https://api.iconify.design/${prefix}/${name}.svg?height=${size}&color=${encodeURIComponent(hex)}`;
-}
-
-export default function StockImagePicker({ kind, onClose, onSelect }) {
-  const isIcon = kind === "icon";
-  const [q, setQ] = useState("");
+export default function StockImagePicker({ kind = "icon", defaultQuery = "", onClose, onSelect }) {
+  const [q, setQ] = useState(defaultQuery);
   const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState([]); // icon: ["mdi:x"]; banner: [{id, preview, full, photographer, alt}]
+  const [results, setResults] = useState([]);
   const [selected, setSelected] = useState(null);
-  const [color, setColor] = useState(ICON_COLORS[0].hex);
   const [searched, setSearched] = useState(false);
   const inputRef = useRef(null);
 
   useEffect(() => { setTimeout(() => inputRef.current?.focus(), 60); }, []);
+
+  // Auto-search using the name already typed into the form.
+  useEffect(() => {
+    if (defaultQuery.trim()) runSearch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function runSearch(e) {
     e?.preventDefault();
@@ -50,22 +41,13 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
     setSelected(null);
     setSearched(true);
     try {
-      if (isIcon) {
-        const res = await fetch(
-          `https://api.iconify.design/search?query=${encodeURIComponent(query)}&limit=64`
-        );
-        if (!res.ok) throw new Error(`Iconify HTTP ${res.status}`);
-        const data = await res.json();
-        setResults(Array.isArray(data.icons) ? data.icons : []);
-      } else {
-        if (!functions) throw new Error("Functions not configured");
-        const call = httpsCallable(functions, "searchStockPhotos");
-        const { data } = await call({ query, perPage: 30 });
-        setResults(data.photos || []);
-      }
+      if (!functions) throw new Error("Functions not configured");
+      const call = httpsCallable(functions, "searchStockPhotos");
+      const { data } = await call({ query, perPage: 30 });
+      setResults(data.photos || []);
     } catch (err) {
       console.error(err);
-      toast.error(isIcon ? "Icon search failed." : "Photo search failed. Is the Pexels key set?");
+      toast.error("Photo search failed. Is the Pexels key set on the backend?");
       setResults([]);
     } finally {
       setLoading(false);
@@ -74,23 +56,13 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
 
   function confirm() {
     if (!selected) return;
-    if (isIcon) {
-      onSelect({
-        __stock: true,
-        source: "iconify",
-        iconId: selected,
-        color,
-        previewUrl: iconSvgUrl(selected, color, 96),
-      });
-    } else {
-      onSelect({
-        __stock: true,
-        source: "pexels",
-        photoUrl: selected.full,
-        previewUrl: selected.preview,
-        photographer: selected.photographer,
-      });
-    }
+    onSelect({
+      __stock: true,
+      source: "pexels",
+      photoUrl: selected.full,
+      previewUrl: selected.preview,
+      photographer: selected.photographer,
+    });
   }
 
   return createPortal(
@@ -100,10 +72,8 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/10">
           <p className="text-sm font-semibold text-white">
-            {isIcon ? "Search icons" : "Search photos"}
-            <span className="text-gray-500 font-normal ml-2 text-xs">
-              {isIcon ? "Open-source icons (Iconify)" : "Royalty-free photos (Pexels)"}
-            </span>
+            Search {kind === "banner" ? "banner" : "image"}
+            <span className="text-gray-500 font-normal ml-2 text-xs">Royalty-free photos (Pexels)</span>
           </p>
           <button type="button" onClick={onClose} className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white">
             <X size={16} />
@@ -118,7 +88,7 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
               ref={inputRef}
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder={isIcon ? "e.g. haircut, spa, razor" : "e.g. hair salon, spa, makeup"}
+              placeholder="e.g. hair salon, facial, manicure, spa"
               className="w-full pl-9 pr-3 py-2 rounded bg-white/10 border border-white/10 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]"
             />
           </div>
@@ -132,23 +102,6 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
           </button>
         </form>
 
-        {/* Icon color swatches */}
-        {isIcon && (
-          <div className="px-5 py-2.5 border-b border-white/10 flex items-center gap-3">
-            <span className="text-xs text-gray-400">Icon color:</span>
-            {ICON_COLORS.map((c) => (
-              <button
-                key={c.hex}
-                type="button"
-                onClick={() => setColor(c.hex)}
-                title={c.label}
-                className={`w-5 h-5 rounded-full border-2 ${color === c.hex ? "border-[#18B79B]" : "border-white/20"}`}
-                style={{ backgroundColor: c.hex }}
-              />
-            ))}
-          </div>
-        )}
-
         {/* Results */}
         <div className="flex-1 overflow-y-auto p-5">
           {loading ? (
@@ -156,30 +109,9 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
               <Loader2 className="animate-spin" size={18} /> Searching…
             </div>
           ) : !searched ? (
-            <p className="text-center text-sm text-gray-600 py-16">
-              Type a keyword and hit Search.
-            </p>
+            <p className="text-center text-sm text-gray-600 py-16">Type a keyword and hit Search.</p>
           ) : results.length === 0 ? (
             <p className="text-center text-sm text-gray-600 py-16">No results. Try another keyword.</p>
-          ) : isIcon ? (
-            <div className="grid grid-cols-6 sm:grid-cols-8 gap-2">
-              {results.map((iconId) => {
-                const isSel = selected === iconId;
-                return (
-                  <button
-                    key={iconId}
-                    type="button"
-                    onClick={() => setSelected(iconId)}
-                    title={iconId}
-                    className={`aspect-square rounded-lg bg-white flex items-center justify-center border-2 transition-colors ${
-                      isSel ? "border-[#18B79B]" : "border-transparent hover:border-white/30"
-                    }`}
-                  >
-                    <img src={iconSvgUrl(iconId, color, 32)} alt={iconId} className="w-7 h-7" />
-                  </button>
-                );
-              })}
-            </div>
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               {results.map((p) => {
@@ -212,9 +144,7 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
         {/* Footer */}
         <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-t border-white/10">
           <p className="text-xs text-gray-500 truncate">
-            {selected
-              ? isIcon ? selected : `Photo by ${selected.photographer} on Pexels`
-              : "Select an image to attach"}
+            {selected ? `Photo by ${selected.photographer} on Pexels` : "Select an image to attach"}
           </p>
           <div className="flex gap-2">
             <button type="button" onClick={onClose} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">

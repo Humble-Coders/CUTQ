@@ -9,7 +9,7 @@ import StockImagePicker from "../../../components/StockImagePicker";
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
 
-function ImagePicker({ label, kind = "icon", value, onChange, preview }) {
+function ImagePicker({ label, kind = "icon", value, onChange, preview, defaultQuery = "" }) {
   const [showPicker, setShowPicker] = useState(false);
 
   const filePreview = useMemo(
@@ -31,7 +31,7 @@ function ImagePicker({ label, kind = "icon", value, onChange, preview }) {
           className="text-xs text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-[#18B79B] file:text-white file:cursor-pointer" />
         <button type="button" onClick={() => setShowPicker(true)}
           className="flex items-center gap-1 px-2.5 py-1 text-xs rounded border border-white/10 text-gray-300 hover:bg-white/5">
-          <Search size={12} /> Search {kind === "banner" ? "photo" : "icon"}
+          <Search size={12} /> Search image
         </button>
         {value?.__stock && (
           <button type="button" onClick={() => onChange(null)}
@@ -41,6 +41,7 @@ function ImagePicker({ label, kind = "icon", value, onChange, preview }) {
       {showPicker && (
         <StockImagePicker
           kind={kind}
+          defaultQuery={defaultQuery}
           onClose={() => setShowPicker(false)}
           onSelect={(sel) => { onChange(sel); setShowPicker(false); }}
         />
@@ -71,7 +72,7 @@ function CategoryForm({ initial, onSave, onCancel, loading }) {
         <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)} className="accent-[#18B79B]" />
         Active
       </label>
-      <ImagePicker label="Icon" kind="icon" value={icon} onChange={setIcon} preview={initial?.icon_url} />
+      <ImagePicker label="Image" kind="icon" value={icon} onChange={setIcon} preview={initial?.icon_url} defaultQuery={name} />
       <div className="flex gap-2 justify-end">
         <button type="button" onClick={onCancel} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">Cancel</button>
         <button type="submit" disabled={loading} className="px-4 py-1.5 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-50">
@@ -110,8 +111,8 @@ function SubcategoryForm({ categories, initial, onSave, onCancel, loading }) {
         <input type="checkbox" checked={isActive} onChange={e => setIsActive(e.target.checked)} className="accent-[#18B79B]" />
         Active
       </label>
-      <ImagePicker label="Icon" kind="icon" value={icon} onChange={setIcon} preview={initial?.icon_url} />
-      <ImagePicker label="Banner" kind="banner" value={banner} onChange={setBanner} preview={initial?.banner_url} />
+      <ImagePicker label="Image" kind="icon" value={icon} onChange={setIcon} preview={initial?.icon_url} defaultQuery={name} />
+      <ImagePicker label="Banner" kind="banner" value={banner} onChange={setBanner} preview={initial?.banner_url} defaultQuery={name} />
       <div className="flex gap-2 justify-end">
         <button type="button" onClick={onCancel} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">Cancel</button>
         <button type="submit" disabled={loading} className="px-4 py-1.5 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-50">

@@ -1084,12 +1084,18 @@ exports.attachRemoteImage = onCall(async (request) => {
     }
     const res = await fetch(photoUrl);
     if (!res.ok) throw new HttpsError("internal", `Photo fetch failed (HTTP ${res.status}).`);
-    // Normalize to a reasonably sized JPEG to keep Storage light.
     const original = Buffer.from(await res.arrayBuffer());
-    buffer = await sharp(original)
-      .resize(1600, 1600, {fit: "inside", withoutEnlargement: true})
-      .jpeg({quality: 82})
-      .toBuffer();
+    // Category/subcategory icons render as large circular tiles in the app, so
+    // square cover-crop them (smart-cropped to the salient region). Banners and
+    // service photos stay wide.
+    const isIconSlot = /\/icon\.jpg$/.test(String(storagePath));
+    let img = sharp(original);
+    if (isIconSlot) {
+      img = img.resize(800, 800, {fit: "cover", position: sharp.strategy.attention});
+    } else {
+      img = img.resize(1600, 1600, {fit: "inside", withoutEnlargement: true});
+    }
+    buffer = await img.jpeg({quality: 82}).toBuffer();
     contentType = "image/jpeg";
   } else {
     throw new HttpsError("invalid-argument", "Unknown image source.");

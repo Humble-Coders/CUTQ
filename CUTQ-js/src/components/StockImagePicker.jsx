@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { httpsCallable } from "firebase/functions";
 import { functions } from "../firebase";
 import { toast } from "sonner";
@@ -92,7 +93,7 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
     }
   }
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick={onClose} />
       <div className="relative bg-[#15171c] border border-white/10 rounded-xl w-full max-w-2xl shadow-2xl flex flex-col max-h-[85vh]">
@@ -104,7 +105,7 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
               {isIcon ? "Open-source icons (Iconify)" : "Royalty-free photos (Pexels)"}
             </span>
           </p>
-          <button onClick={onClose} className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white">
+          <button type="button" onClick={onClose} className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white">
             <X size={16} />
           </button>
         </div>
@@ -216,10 +217,11 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
               : "Select an image to attach"}
           </p>
           <div className="flex gap-2">
-            <button onClick={onClose} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">
+            <button type="button" onClick={onClose} className="px-4 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5">
               Cancel
             </button>
             <button
+              type="button"
               onClick={confirm}
               disabled={!selected}
               className="px-4 py-1.5 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-40 flex items-center gap-1.5"
@@ -229,6 +231,7 @@ export default function StockImagePicker({ kind, onClose, onSelect }) {
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

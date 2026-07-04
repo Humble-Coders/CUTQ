@@ -956,35 +956,64 @@ exports.onServiceReviewCreated = onDocumentCreated(
   },
 );
 
-// ── Stock image search & attach (admin panel) ──────────────────────────────────
+// ── Stock image search & attach (admin panel + salon dashboard) ─────────────────
 //
-// Two callables used by the admin Categories tab so an admin can search for an
-// image by keyword and attach it to a category/subcategory instead of uploading:
+// Two callables so staff can search for a royalty-free image by keyword and
+// attach it instead of uploading a file:
 //   - searchStockPhotos: proxies Pexels (keeps the API key server-side).
 //   - attachRemoteImage: downloads the chosen image server-side (no CORS),
 //       rasterizes Iconify SVGs to PNG (the mobile app can't render SVG), and
-//       uploads it to the same Storage path the manual upload flow uses.
+//       uploads it to a Storage path the caller is authorized to write.
 // Iconify icon search is done directly from the browser (keyless, CORS-enabled).
+//
+// Used by: admin Categories tab (category/subcategory icon + banner) and the
+// salon dashboard Services screen (service photos).
 
 const IMAGE_CACHE_CONTROL = "public, max-age=31536000";
-// Only these Storage paths may be written by attachRemoteImage (prevents an
-// authenticated admin from being tricked into overwriting arbitrary objects).
-const ALLOWED_IMAGE_PATH = /^service_(categories|subcategories)\/[A-Za-z0-9_-]+\/(icon|banner)\.jpg$/;
+// Admin-only paths (category / subcategory icon + banner).
+const ADMIN_IMAGE_PATH = /^service_(categories|subcategories)\/[A-Za-z0-9_-]+\/(icon|banner)\.jpg$/;
+// Salon-owner path (service photo): salons/{salonId}/services/{serviceId}/{photoId}.jpg
+const SALON_SERVICE_PHOTO_PATH =
+  /^salons\/([A-Za-z0-9_-]+)\/services\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\.jpg$/;
 const ICON_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
-async function requireAdmin(auth) {
+// A signed-in, enabled staff member (ADMIN or SALONOWNER). Used to gate search.
+async function requireStaff(auth) {
   if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
   const profile = await getUserProfile(auth.uid);
   const role = String(profile?.Role || profile?.role || "").toUpperCase();
-  if (role !== "ADMIN" || profile?.isEnabled !== true) {
-    throw new HttpsError("permission-denied", "Admin access required.");
+  if ((role !== "ADMIN" && role !== "SALONOWNER") || profile?.isEnabled !== true) {
+    throw new HttpsError("permission-denied", "Staff access required.");
   }
-  return profile;
+  return {profile, role};
+}
+
+// Authorize a write to `storagePath`: admins may write category/subcategory
+// images; a salon owner may write photos only under a salon they own.
+async function authorizeImagePath(auth, storagePath) {
+  const {role} = await requireStaff(auth);
+  const path = String(storagePath || "");
+
+  if (ADMIN_IMAGE_PATH.test(path)) {
+    if (role !== "ADMIN") throw new HttpsError("permission-denied", "Admin access required.");
+    return;
+  }
+  const salonMatch = SALON_SERVICE_PHOTO_PATH.exec(path);
+  if (salonMatch) {
+    if (role === "ADMIN") return;
+    const salonId = salonMatch[1];
+    const salonSnap = await admin.firestore().collection("salons").doc(salonId).get();
+    if (!salonSnap.exists || salonSnap.data()?.owner_uid !== auth.uid) {
+      throw new HttpsError("permission-denied", "You can only add photos to your own salon.");
+    }
+    return;
+  }
+  throw new HttpsError("invalid-argument", "Invalid storage path.");
 }
 
 exports.searchStockPhotos = onCall({secrets: [PEXELS_API_KEY]}, async (request) => {
-  await requireAdmin(request.auth);
+  await requireStaff(request.auth);
 
   const {query, page = 1, perPage = 24} = request.data || {};
   if (!query || !String(query).trim()) {
@@ -1015,12 +1044,10 @@ exports.searchStockPhotos = onCall({secrets: [PEXELS_API_KEY]}, async (request) 
 });
 
 exports.attachRemoteImage = onCall(async (request) => {
-  await requireAdmin(request.auth);
-
   const {source, storagePath, iconId, color, photoUrl} = request.data || {};
-  if (!ALLOWED_IMAGE_PATH.test(String(storagePath || ""))) {
-    throw new HttpsError("invalid-argument", "Invalid storage path.");
-  }
+  // Authorizes the caller for this exact path (admin paths vs salon-owned paths)
+  // and rejects any path outside the allowlist.
+  await authorizeImagePath(request.auth, storagePath);
 
   let buffer;
   let contentType;

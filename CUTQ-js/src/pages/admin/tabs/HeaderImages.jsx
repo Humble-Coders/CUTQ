@@ -46,7 +46,7 @@ export default function HeaderImages() {
         <div>
           <h2 className="text-lg font-semibold text-white">Header Images</h2>
           <p className="text-xs text-gray-500 mt-0.5">
-            Images shown in the app header carousel — stored in{" "}
+            Images shown in the app header carousel - stored in{" "}
             <code className="text-gray-400">app_config/header</code>
           </p>
         </div>

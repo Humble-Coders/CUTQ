@@ -1,0 +1,68 @@
+rules_version = '2';
+
+// CutQ Cloud Storage security rules.
+//
+// All media is publicly readable (salon logos, service photos, category icons,
+// header images are shown in the customer app). Writes are restricted to the
+// relevant salon staff / admin, and constrained to reasonably-sized images.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function userRole() {
+      return isSignedIn()
+        && firestore.exists(/databases/(default)/documents/Users/$(uid()))
+        ? firestore.get(/databases/(default)/documents/Users/$(uid())).data.Role : '';
+    }
+    function isAdmin() { return userRole() == 'ADMIN'; }
+
+    function isSalonStaff(salonId) {
+      let p = /databases/(default)/documents/salons/$(salonId);
+      return isSignedIn() && firestore.exists(p) && (
+        firestore.get(p).data.owner_uid == uid() ||
+        (firestore.get(p).data.team_uids is list && uid() in firestore.get(p).data.team_uids)
+      );
+    }
+
+    function validImage() {
+      return request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    // Salon media: logo, cover, gallery, service & stylist photos.
+    match /salons/{salonId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if validImage() && (isSalonStaff(salonId) || isAdmin());
+    }
+
+    // Admin-managed catalog media.
+    match /service_categories/{allPaths=**} {
+      allow read: if true;
+      allow write: if validImage() && isAdmin();
+    }
+    match /service_subcategories/{allPaths=**} {
+      allow read: if true;
+      allow write: if validImage() && isAdmin();
+    }
+    match /explore_section/{allPaths=**} {
+      allow read: if true;
+      allow write: if validImage() && isAdmin();
+    }
+    match /app_config/{allPaths=**} { // header images
+      allow read: if true;
+      allow write: if validImage() && isAdmin();
+    }
+
+    // User profile photos (self-managed).
+    match /Users/{userId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if validImage() && isSignedIn() && userId == uid();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

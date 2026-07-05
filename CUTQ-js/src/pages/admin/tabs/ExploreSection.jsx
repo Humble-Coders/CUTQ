@@ -60,7 +60,7 @@ function ExploreSectionForm({ categories, initial, nextOrder, onSave, onCancel, 
     >
       <div className="flex items-center gap-2 mb-1">
         <span className="text-xs font-medium text-gray-400">
-          {initial ? `Editing slot #${initial.order}` : `New item — will be assigned order #${nextOrder}`}
+          {initial ? `Editing slot #${initial.order}` : `New item - will be assigned order #${nextOrder}`}
         </span>
       </div>
 
@@ -184,7 +184,7 @@ export default function ExploreSection() {
         <div>
           <h2 className="text-lg font-semibold text-white">Explore Section</h2>
           <p className="text-xs text-gray-500 mt-0.5">
-            Up to {MAX_ITEMS} featured items — stored in{" "}
+            Up to {MAX_ITEMS} featured items - stored in{" "}
             <code className="text-gray-400">explore_section</code>
           </p>
         </div>

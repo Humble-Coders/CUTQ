@@ -32,7 +32,7 @@ export default function Support() {
       <div>
         <h2 className="text-lg font-semibold text-white">Support Management</h2>
         <p className="text-sm text-gray-400 mt-1">
-          Manage app support content — all changes reflect immediately in the user app.
+          Manage app support content - all changes reflect immediately in the user app.
         </p>
       </div>
 
@@ -399,7 +399,7 @@ function PolicyEditor({ type }) {
     <div className="space-y-3">
       <p className="text-sm text-gray-400">
         Write your policy using the rich text editor below. The content is saved as HTML and
-        displayed in a web view inside the app — formatting is fully preserved.
+        displayed in a web view inside the app - formatting is fully preserved.
       </p>
 
       <div className="rounded-xl border border-white/10 overflow-hidden bg-[#111]">

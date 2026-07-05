@@ -7,6 +7,7 @@ const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const sharp = require("sharp");
+const ledger = require("./ledger");
 
 const SMTP_USER = defineSecret("SMTP_USER");
 const SMTP_PASS = defineSecret("SMTP_PASS");
@@ -1116,3 +1117,610 @@ exports.attachRemoteImage = onCall(async (request) => {
     `${encodeURIComponent(storagePath)}?alt=media&token=${token}`;
   return {url};
 });
+
+// ── Customer Support Representative (admin panel) ───────────────────────────────
+//
+// A SUPPORT user signs into the admin panel and sees only the Bookings section.
+// They call the salon + customer to confirm each booking, then mark the two
+// support_called_* flags. These callables keep the logic rules-independent and
+// server-side (a SUPPORT user has no direct Firestore read/write grants):
+//   - supportListBookings: all bookings, joined with salon + customer name/phone.
+//   - markSupportCall: set support_called_salon / support_called_customer.
+//   - createSupportRep: admin creates a SUPPORT account.
+
+// Require the caller to hold one of `roles` (and be enabled).
+async function requireRole(auth, roles) {
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+  const profile = await getUserProfile(auth.uid);
+  const role = String(profile?.Role || profile?.role || "").toUpperCase();
+  if (!roles.includes(role) || profile?.isEnabled !== true) {
+    throw new HttpsError("permission-denied", "Not authorized.");
+  }
+  return {profile, role, uid: auth.uid};
+}
+
+const toMs = (t) => t?.toDate?.()?.getTime?.() ?? (typeof t === "number" ? t : null);
+
+exports.supportListBookings = onCall(async (request) => {
+  await requireRole(request.auth, ["ADMIN", "SUPPORT"]);
+  const db = admin.firestore();
+
+  const limitN = Math.min(Math.max(Number(request.data?.limit) || 500, 1), 1000);
+  const snap = await db.collection("bookings")
+    .orderBy("created_at", "desc").limit(limitN).get();
+  const bookings = snap.docs.map((d) => ({id: d.id, ...d.data()}));
+
+  // Batch-join salon + customer docs.
+  const salonIds = [...new Set(bookings.map((b) => b.salon_id).filter(Boolean))];
+  const userIds = [...new Set(bookings.map((b) => b.user_id).filter(Boolean))];
+  const [salonDocs, userDocs] = await Promise.all([
+    salonIds.length ? db.getAll(...salonIds.map((id) => db.collection("salons").doc(id))) : [],
+    userIds.length ? db.getAll(...userIds.map((id) => db.collection("Users").doc(id))) : [],
+  ]);
+  const salonMap = {};
+  salonDocs.forEach((d) => {
+    if (d.exists) salonMap[d.id] = d.data();
+  });
+  const userMap = {};
+  userDocs.forEach((d) => {
+    if (d.exists) userMap[d.id] = d.data();
+  });
+
+  const result = bookings.map((b) => {
+    const salon = salonMap[b.salon_id] || {};
+    const user = userMap[b.user_id] || {};
+    const services = Array.isArray(b.services) && b.services.length ?
+      b.services.map((s) => ({
+        name: s.service_name || "",
+        price: s.service_price || 0,
+        duration_minutes: s.duration_minutes || 0,
+      })) :
+      (b.service_id ? [{name: b.service_name || "Service", price: b.service_price || 0}] : []);
+    return {
+      id: b.id,
+      status: b.status || "pending",
+      created_at_ms: toMs(b.created_at),
+      slot_start_ms: toMs(b.slot_start),
+      slot_end_ms: toMs(b.slot_end),
+      salon_id: b.salon_id || "",
+      salon_name: b.salon_name || salon.name || "",
+      salon_phone: salon.phone || "",
+      salon_city: salon.city || "",
+      user_id: b.user_id || "",
+      // Walk-ins have no user_id; their name/phone live on the booking itself.
+      customer_name: user.name || b.customer_name || "",
+      customer_phone: user.phone || b.customer_phone || "",
+      is_walk_in: b.is_walk_in === true,
+      // "Book for someone else" — booking placed by the account holder for a
+      // third party. The beneficiary is who gets served; customer_name above
+      // remains the account holder (the person who actually booked).
+      booked_for_other: b.booked_for_other === true,
+      beneficiary_name: b.beneficiary_name || "",
+      beneficiary_phone: b.beneficiary_phone || "",
+      beneficiary_gender: b.beneficiary_gender || "",
+      services,
+      total_service_price: b.total_service_price ?? b.service_price ?? 0,
+      booking_fee: b.booking_fee ?? 0,
+      discount_amount: b.discount_amount ?? 0,
+      final_amount: b.final_amount ?? 0,
+      notes: b.notes || "",
+      coupon_code: b.coupon_code || null,
+      support_called_salon: b.support_called_salon === true,
+      support_called_customer: b.support_called_customer === true,
+    };
+  });
+  return {bookings: result};
+});
+
+exports.markSupportCall = onCall(async (request) => {
+  await requireRole(request.auth, ["ADMIN", "SUPPORT"]);
+  const {bookingId, target, done} = request.data || {};
+  if (!bookingId || (target !== "salon" && target !== "customer")) {
+    throw new HttpsError("invalid-argument", "bookingId and target (salon|customer) are required.");
+  }
+  const field = target === "salon" ? "support_called_salon" : "support_called_customer";
+  const db = admin.firestore();
+  const ref = db.collection("bookings").doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Booking not found.");
+
+  await ref.update({
+    [field]: done === true,
+    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  const after = (await ref.get()).data() || {};
+  return {
+    support_called_salon: after.support_called_salon === true,
+    support_called_customer: after.support_called_customer === true,
+  };
+});
+
+exports.createSupportRep = onCall(async (request) => {
+  await requireRole(request.auth, ["ADMIN"]);
+  const {email, name, phone} = request.data || {};
+  if (!email || !String(email).trim()) {
+    throw new HttpsError("invalid-argument", "A valid email is required.");
+  }
+  const cleanEmail = String(email).trim();
+  const db = admin.firestore();
+
+  let uid;
+  let password = randomPassword(10);
+  let isExisting = false;
+  try {
+    const u = await admin.auth().createUser({
+      email: cleanEmail,
+      password,
+      emailVerified: true,
+      displayName: String(name || "").trim(),
+    });
+    uid = u.uid;
+  } catch (err) {
+    if (err.code === "auth/email-already-exists") {
+      const u = await admin.auth().getUserByEmail(cleanEmail);
+      uid = u.uid;
+      isExisting = true;
+      password = null;
+    } else if (err.code === "auth/invalid-email") {
+      throw new HttpsError("invalid-argument", "The email address is not valid.");
+    } else {
+      logger.error("createSupportRep createUser failed", err);
+      throw new HttpsError("internal", `Could not create account: ${err.message || "unknown"}`);
+    }
+  }
+
+  await db.collection("Users").doc(uid).set({
+    name: String(name || "").trim(),
+    phone: String(phone || "").trim(),
+    email: cleanEmail,
+    profile_photo: "",
+    gender: "",
+    dob: "",
+    Role: "SUPPORT",
+    isEnabled: true,
+    created_at: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+
+  return {uid, email: cleanEmail, password, isExisting};
+});
+
+// ── Accounting (Humble Ledger) callables ────────────────────────────────────────
+//
+// All ledger traffic is proxied here (the API's CORS blocks the dashboard origin).
+// Each call is authorized as the salon owner (or an ADMIN). See ledger.js.
+
+// Verify the caller owns `salonId` (or is an ADMIN). Returns the salon data.
+async function assertSalonOwner(auth, salonId) {
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+  if (!salonId) throw new HttpsError("invalid-argument", "salonId is required.");
+  const snap = await admin.firestore().collection("salons").doc(salonId).get();
+  if (!snap.exists) throw new HttpsError("not-found", "Salon not found.");
+  const salon = snap.data();
+  if (salon.owner_uid !== auth.uid) {
+    const prof = await getUserProfile(auth.uid);
+    if (String(prof?.Role || "").toUpperCase() !== "ADMIN") {
+      throw new HttpsError("permission-denied", "Not authorized for this salon.");
+    }
+  }
+  return salon;
+}
+
+exports.ledgerProvisionSalon = onCall(async (request) => {
+  const {salonId} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  const rec = await ledger.provisionSalon(salonId);
+  return {provisioned: true, companyId: rec.companyId || null, accounts: rec.accounts};
+});
+
+exports.ledgerRecordSale = onCall(async (request) => {
+  const {bookingId} = request.data || {};
+  if (!bookingId) throw new HttpsError("invalid-argument", "bookingId is required.");
+  const bref = admin.firestore().collection("bookings").doc(bookingId);
+  const bsnap = await bref.get();
+  if (!bsnap.exists) throw new HttpsError("not-found", "Booking not found.");
+  const booking = bsnap.data();
+  await assertSalonOwner(request.auth, booking.salon_id);
+  if (booking.status !== "completed") {
+    throw new HttpsError("failed-precondition", "Booking is not completed.");
+  }
+  if (booking.ledger?.posted) return {alreadyPosted: true, ledger: booking.ledger};
+
+  // Claim a short-lived posting lock to avoid double-posting on rapid retries.
+  const claimed = await admin.firestore().runTransaction(async (tx) => {
+    const s = await tx.get(bref);
+    const l = s.data().ledger || {};
+    if (l.posted) return false;
+    const lockedAt = l.posting_at?.toMillis?.() || 0;
+    if (l.posting && Date.now() - lockedAt < 60000) return false;
+    tx.set(bref, {ledger: {...l, posting: true, posting_at: admin.firestore.FieldValue.serverTimestamp()}}, {merge: true});
+    return true;
+  });
+  if (!claimed) throw new HttpsError("aborted", "Posting already in progress.");
+
+  try {
+    const refs = await ledger.recordSaleForBooking(bookingId);
+    const update = {
+      ledger: {...refs, posted: true, posting: false, error: null,
+        posted_at: admin.firestore.FieldValue.serverTimestamp()},
+    };
+    // Customer-facing bill (stored so the salon and, later, the app can open it).
+    update.bill = {
+      url: refs.billUrl || null,
+      invoiceNo: refs.invoiceNumber || null,
+      error: refs.billError || null,
+      generated_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await bref.set(update, {merge: true});
+    return {posted: true, ledger: refs, bill: update.bill};
+  } catch (err) {
+    await bref.set({ledger: {posted: false, posting: false, error: String(err.message || err)}}, {merge: true});
+    logger.error("ledgerRecordSale failed", {bookingId, msg: err.message});
+    throw new HttpsError("internal", `Accounting post failed: ${err.message}`);
+  }
+});
+
+exports.ledgerReverseSale = onCall(async (request) => {
+  const {bookingId} = request.data || {};
+  const bref = admin.firestore().collection("bookings").doc(bookingId);
+  const bsnap = await bref.get();
+  if (!bsnap.exists) throw new HttpsError("not-found", "Booking not found.");
+  const booking = bsnap.data();
+  await assertSalonOwner(request.auth, booking.salon_id);
+  if (!booking.ledger?.posted) return {reversed: false, reason: "not posted"};
+  const results = await ledger.reverseSaleForBooking(bookingId, booking.ledger);
+  await bref.set({ledger: {...booking.ledger, posted: false, reversed: true, reverse_results: results,
+    reversed_at: admin.firestore.FieldValue.serverTimestamp()}}, {merge: true});
+  return {reversed: true, results};
+});
+
+exports.ledgerRecordExpense = onCall(async (request) => {
+  const {salonId, amount, expenseAccountId, paymentMethod, description, date} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  if (!(Number(amount) > 0)) throw new HttpsError("invalid-argument", "amount must be > 0.");
+  if (!description) throw new HttpsError("invalid-argument", "description is required.");
+  const {cred} = await ledger.ensureSalonLedger(salonId);
+  let expAcct = expenseAccountId;
+  if (!expAcct) {
+    const accts = (await ledger.authed(cred, "/accounts", {query: {type: "EXPENSE", limit: 100}})).data || [];
+    expAcct = (accts.find((a) => a.name === "Operating Expense") || accts[0] || {}).id;
+  }
+  const res = await ledger.authed(cred, "/expenses", {method: "POST", body: {
+    amount: Number(amount), expenseAccountId: expAcct,
+    paymentMethod: paymentMethod === "BANK" ? "BANK" : "CASH",
+    description, appId: ledger.APP_ID, sourceId: `exp_${Date.now()}`,
+    date: date || new Date().toISOString().slice(0, 10),
+  }});
+  return {success: true, txnId: res.data?.transaction?.id || null};
+});
+
+exports.ledgerRecordCutqRemittance = onCall(async (request) => {
+  const {salonId, amount, method, description, date} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  if (!(Number(amount) > 0)) throw new HttpsError("invalid-argument", "amount must be > 0.");
+  const {cred} = await ledger.ensureSalonLedger(salonId);
+  const sourceId = `remit_${Date.now()}`;
+  const res = await ledger.authed(cred, "/vendor-payments", {method: "POST", body: {
+    vendorId: cred.cutqVendorId, amount: Number(amount),
+    method: method === "BANK" ? "BANK" : "CASH",
+    description: description || "CutQ booking-fee remittance",
+    appId: ledger.APP_ID, sourceId, date: date || new Date().toISOString().slice(0, 10),
+  }});
+  await admin.firestore().collection("salons").doc(salonId).collection("cutq_remittances").add({
+    amount: Number(amount), method: method === "BANK" ? "BANK" : "CASH",
+    description: description || "CutQ booking-fee remittance",
+    txnId: res.data?.transaction?.id || null, sourceId,
+    created_at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return {success: true, txnId: res.data?.transaction?.id || null};
+});
+
+// How much the salon still owes CutQ = booking fees collected (all completed
+// bookings) − already remitted. Also returns the fee collected within [from,to].
+exports.ledgerCutqSummary = onCall(async (request) => {
+  const {salonId, from, to} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  const db = admin.firestore();
+  const snap = await db.collection("bookings")
+    .where("salon_id", "==", salonId).where("status", "==", "completed").get();
+  const fromMs = from ? new Date(from).getTime() : null;
+  const toMs = to ? new Date(to).getTime() + 86400000 : null;
+  let allCollected = 0; let rangeCollected = 0; let count = 0; let rangeCount = 0;
+  snap.forEach((d) => {
+    const b = d.data();
+    const fee = Number(b.booking_fee) || 0;
+    allCollected += fee; count++;
+    const t = b.completion?.completed_at?.toMillis?.() || b.updated_at?.toMillis?.() || 0;
+    if ((!fromMs || t >= fromMs) && (!toMs || t < toMs)) {
+      rangeCollected += fee; rangeCount++;
+    }
+  });
+  const remSnap = await db.collection("salons").doc(salonId).collection("cutq_remittances").get();
+  let remitted = 0;
+  remSnap.forEach((d) => {
+    remitted += Number(d.data().amount) || 0;
+  });
+  return {allCollected, remitted, owed: Math.max(0, allCollected - remitted),
+    count, rangeCollected, rangeCount, from: from || null, to: to || null};
+});
+
+// Read proxy for the Accounts section — dispatches to Humble Ledger read endpoints.
+exports.ledgerQuery = onCall(async (request) => {
+  const {salonId, resource, params = {}} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  const {cred} = await ledger.ensureSalonLedger(salonId);
+  const q = (path, query) => ledger.authed(cred, path, {query});
+  switch (resource) {
+    case "meta":
+      return {accounts: cred.accounts, cutqVendorId: cred.cutqVendorId, companyId: cred.companyId || null};
+    case "accounts": return q("/accounts", {limit: 200, ...params});
+    case "transactions": return q("/transactions", {limit: 50, ...params});
+    case "ledger": return q("/ledger", {limit: 100, ...params});
+    case "report_pnl": return q("/reports/pnl", params);
+    case "report_trial_balance": return q("/reports/trial-balance", params);
+    case "report_balance_sheet": return q("/reports/balance-sheet", params);
+    case "receivables": return q("/receivables", {limit: 100, ...params});
+    case "invoices": return q("/invoices", {limit: 50, ...params});
+    case "vendors": return q("/vendors", {limit: 50, ...params});
+    default:
+      throw new HttpsError("invalid-argument", `Unknown resource: ${resource}`);
+  }
+});
+
+// ── Salon team members (SALONTEAM role) ─────────────────────────────────────────
+//
+// A salon owner can add team members with access to a chosen set of modules
+// (UI-gated only; no per-module Firestore rules). Dashboard is always included;
+// the Team module itself is never grantable. A member's per-salon access lives
+// on their own Users doc (`salon_access.<salonId>`) so they can read it, and on
+// `salons/<salonId>/team/<uid>` so the owner can list the team.
+
+const GRANTABLE_MODULES = [
+  "dashboard", "bookings", "schedule", "services",
+  "stylists", "customers", "past_bookings", "accounts", "settings",
+];
+
+function sanitizeModules(modules) {
+  let m = Array.isArray(modules) ? modules.filter((x) => GRANTABLE_MODULES.includes(x)) : [];
+  if (!m.includes("dashboard")) m.unshift("dashboard"); // always on, default
+  m = [...new Set(m)];
+  return m.length ? m : ["dashboard"];
+}
+
+exports.addSalonTeamMember = onCall({secrets: [SMTP_USER, SMTP_PASS]}, async (request) => {
+  const {salonId, email, name, phone, modules} = request.data || {};
+  const salon = await assertSalonOwner(request.auth, salonId);
+  if (!email || !String(email).trim()) {
+    throw new HttpsError("invalid-argument", "A valid email is required.");
+  }
+  const cleanEmail = String(email).trim();
+  const cleanModules = sanitizeModules(modules);
+  const db = admin.firestore();
+
+  let uid;
+  let password = randomPassword(10);
+  let isExisting = false;
+  try {
+    const u = await admin.auth().createUser({
+      email: cleanEmail, password, emailVerified: true, displayName: String(name || "").trim(),
+    });
+    uid = u.uid;
+  } catch (err) {
+    if (err.code === "auth/email-already-exists") {
+      const u = await admin.auth().getUserByEmail(cleanEmail);
+      uid = u.uid;
+      isExisting = true;
+      password = null;
+    } else if (err.code === "auth/invalid-email") {
+      throw new HttpsError("invalid-argument", "The email address is not valid.");
+    } else {
+      logger.error("addSalonTeamMember createUser failed", err);
+      throw new HttpsError("internal", `Could not create account: ${err.message || "unknown"}`);
+    }
+  }
+
+  // Never downgrade an existing owner/admin; otherwise mark as SALONTEAM.
+  const uref = db.collection("Users").doc(uid);
+  const existing = await uref.get();
+  const existingRole = existing.exists ? existing.data().Role : null;
+  const roleToSet = (existingRole === "SALONOWNER" || existingRole === "ADMIN") ? existingRole : "SALONTEAM";
+
+  const userDoc = {
+    name: String(name || "").trim() || existing.data()?.name || "",
+    phone: String(phone || "").trim(),
+    email: cleanEmail,
+    Role: roleToSet,
+    isEnabled: true,
+    salon_access: {
+      [salonId]: {
+        modules: cleanModules,
+        is_active: true,
+        salon_name: salon.name || "",
+        added_at: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    },
+  };
+  if (!existing.exists) {
+    Object.assign(userDoc, {profile_photo: "", gender: "", dob: "", created_at: admin.firestore.FieldValue.serverTimestamp()});
+  }
+
+  // All three Firestore writes are committed atomically so a membership can
+  // never end up half-created (e.g. salon_access set but team_uids missing).
+  const batch = db.batch();
+  batch.set(uref, userDoc, {merge: true});
+  batch.set(db.collection("salons").doc(salonId).collection("team").doc(uid), {
+    uid, name: String(name || "").trim(), email: cleanEmail, phone: String(phone || "").trim(),
+    modules: cleanModules, is_active: true,
+    created_at: admin.firestore.FieldValue.serverTimestamp(),
+    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  batch.update(db.collection("salons").doc(salonId), {team_uids: admin.firestore.FieldValue.arrayUnion(uid)});
+  await batch.commit();
+
+  let emailSent = false;
+  if (!isExisting) {
+    try {
+      const smtpUser = SMTP_USER.value();
+      const smtpPass = SMTP_PASS.value();
+      if (smtpUser && smtpPass) {
+        await nodemailer.createTransport({
+          host: "smtp.gmail.com", port: 465, secure: true, auth: {user: smtpUser, pass: smtpPass},
+        }).sendMail({
+          from: `"CUTQ Salon" <${smtpUser}>`,
+          to: cleanEmail,
+          subject: `You've been added to ${salon.name || "a salon"} — CUTQ`,
+          text:
+            `Hello ${name || "there"},\n\n` +
+            `You've been added to ${salon.name || "a salon"} on CUTQ.\n\n` +
+            `Email: ${cleanEmail}\n` +
+            `Temporary password: ${password}\n\n` +
+            "Sign in to the salon dashboard and change your password.\n",
+          html: buildEmailHtml(name, cleanEmail, password),
+        });
+        emailSent = true;
+      }
+    } catch (mailErr) {
+      logger.error("addSalonTeamMember email failed (non-fatal)", {uid, err: mailErr});
+    }
+  }
+
+  return {uid, email: cleanEmail, password, isExisting, emailSent, modules: cleanModules};
+});
+
+exports.updateSalonTeamMember = onCall(async (request) => {
+  const {salonId, memberUid, modules, is_active: isActive} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  if (!memberUid) throw new HttpsError("invalid-argument", "memberUid is required.");
+  const db = admin.firestore();
+
+  const teamPatch = {updated_at: admin.firestore.FieldValue.serverTimestamp()};
+  const accessPatch = {};
+  if (modules !== undefined) {
+    const clean = sanitizeModules(modules);
+    teamPatch.modules = clean;
+    accessPatch.modules = clean;
+  }
+  if (isActive !== undefined) {
+    teamPatch.is_active = !!isActive;
+    accessPatch.is_active = !!isActive;
+  }
+  await db.collection("salons").doc(salonId).collection("team").doc(memberUid).set(teamPatch, {merge: true});
+  await db.collection("Users").doc(memberUid).set({salon_access: {[salonId]: accessPatch}}, {merge: true});
+  return {success: true};
+});
+
+exports.removeSalonTeamMember = onCall(async (request) => {
+  const {salonId, memberUid} = request.data || {};
+  await assertSalonOwner(request.auth, salonId);
+  if (!memberUid) throw new HttpsError("invalid-argument", "memberUid is required.");
+  const db = admin.firestore();
+  await db.collection("salons").doc(salonId).collection("team").doc(memberUid).delete();
+  await db.collection("salons").doc(salonId).update({team_uids: admin.firestore.FieldValue.arrayRemove(memberUid)});
+  await db.collection("Users").doc(memberUid).update({[`salon_access.${salonId}`]: admin.firestore.FieldValue.delete()});
+  return {success: true};
+});
+
+// ── Issue reports ───────────────────────────────────────────────────────────────
+//
+// Users file reports from the app (reports/{id}). On create we email the admin's
+// configured recipients (report_config/settings.notify_emails); when a report is
+// marked resolved we push an FCM notification to the reporter.
+
+exports.onReportCreated = onDocumentCreated(
+  {document: "reports/{reportId}", secrets: [SMTP_USER, SMTP_PASS]},
+  async (event) => {
+    const report = event.data?.data?.() || {};
+    const reportId = event.params.reportId;
+    const db = admin.firestore();
+
+    let emails = [];
+    try {
+      const cfg = await db.collection("report_config").doc("settings").get();
+      emails = Array.isArray(cfg.data()?.notify_emails) ? cfg.data().notify_emails.filter(Boolean) : [];
+    } catch (err) {
+      logger.error("onReportCreated: failed to read report_config", err);
+    }
+    if (emails.length === 0) {
+      logger.info("onReportCreated: no notify_emails configured — skipping email", {reportId});
+      return;
+    }
+
+    const smtpUser = SMTP_USER.value();
+    const smtpPass = SMTP_PASS.value();
+    if (!smtpUser || !smtpPass) {
+      logger.warn("onReportCreated: SMTP not configured — skipping email", {reportId});
+      return;
+    }
+
+    const lines = [
+      `A new issue was reported on CUTQ.`,
+      ``,
+      `Category: ${report.category_name || "—"}`,
+      `Reported by: ${report.user_name || "Unknown"}${report.user_phone ? ` (${report.user_phone})` : ""}`,
+      report.about_booking && report.booking_id ?
+        `Related booking: ${report.booking_id}${report.booking_brief?.salon_name ? ` — ${report.booking_brief.salon_name}` : ""}` : null,
+      ``,
+      `Description:`,
+      report.description || "(none)",
+      ``,
+      `Report ID: ${reportId}`,
+    ].filter((l) => l !== null).join("\n");
+
+    try {
+      await nodemailer.createTransport({
+        host: "smtp.gmail.com", port: 465, secure: true, auth: {user: smtpUser, pass: smtpPass},
+      }).sendMail({
+        from: `"CUTQ Reports" <${smtpUser}>`,
+        to: emails.join(", "),
+        subject: `New issue reported: ${report.category_name || "General"} — CUTQ`,
+        text: lines,
+      });
+      logger.info("onReportCreated: notification email sent", {reportId, recipients: emails.length});
+    } catch (err) {
+      logger.error("onReportCreated: email failed", {reportId, err});
+    }
+  },
+);
+
+exports.onReportResolved = onDocumentUpdated(
+  "reports/{reportId}",
+  async (event) => {
+    const before = event.data?.before?.data?.() || {};
+    const after = event.data?.after?.data?.() || {};
+    // Only when status transitions into "resolved".
+    if (before.status === after.status || after.status !== "resolved") return;
+
+    const reportId = event.params.reportId;
+    const userId = after.user_id || "";
+    if (!userId) return;
+
+    const db = admin.firestore();
+    const userSnap = await db.collection("Users").doc(userId).get();
+    const token = userSnap.data()?.fcm_token;
+    if (!token) {
+      logger.info("onReportResolved: reporter has no fcm_token", {reportId, userId});
+      return;
+    }
+
+    const message = {
+      token,
+      notification: {
+        title: "Your issue has been resolved",
+        body: `Your report about "${after.category_name || "an issue"}" has been marked resolved.`,
+      },
+      data: {report_id: String(reportId), type: "report_resolved"},
+      android: {priority: "high", notification: {channelId: "cutq_bookings", sound: "default", priority: "high"}},
+      apns: {payload: {aps: {sound: "default", badge: 1}}},
+    };
+    try {
+      await admin.messaging().send(message);
+      logger.info("onReportResolved: sent FCM", {reportId, userId});
+    } catch (err) {
+      if (err.code === "messaging/registration-token-not-registered" ||
+          err.code === "messaging/invalid-registration-token") {
+        await db.collection("Users").doc(userId).update({fcm_token: admin.firestore.FieldValue.delete()}).catch(() => {});
+      } else {
+        logger.error("onReportResolved: FCM failed", {reportId, err});
+      }
+    }
+  },
+);

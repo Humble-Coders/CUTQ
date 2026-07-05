@@ -1,0 +1,205 @@
+rules_version = '2';
+
+// CutQ Firestore security rules.
+//
+// Model:
+//  - Cloud Functions use the Admin SDK and BYPASS these rules (all privileged
+//    writes — ledger, team provisioning, ratings aggregation, booking validation
+//    — happen there).
+//  - Catalog data (salons, services, categories, reviews, config) is publicly
+//    readable so the customer app can browse.
+//  - Personal data (Users, bookings) requires auth + ownership.
+//  - Sensitive/derived fields are frozen so clients can't tamper with them.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── helpers ────────────────────────────────────────────────────────────
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function userPath() { return /databases/$(database)/documents/Users/$(uid()); }
+    function myRole() {
+      return isSignedIn() && exists(userPath()) ? get(userPath()).data.Role : '';
+    }
+    function isAdmin() { return myRole() == 'ADMIN'; }
+    function isSalonRole() {
+      return myRole() == 'SALONOWNER' || myRole() == 'SALONTEAM';
+    }
+
+    // True if the caller owns or is on the team of `salonId`.
+    function isSalonStaff(salonId) {
+      let p = /databases/$(database)/documents/salons/$(salonId);
+      return isSignedIn() && exists(p) && (
+        get(p).data.owner_uid == uid() ||
+        (get(p).data.team_uids is list && uid() in get(p).data.team_uids)
+      );
+    }
+
+    // True if the write does NOT modify any of `fields`.
+    function frozen(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isImageRating() {
+      return request.resource.data.rating is number
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5;
+    }
+
+    // ── Users ────────────────────────────────────────────────────────────────
+    // Any signed-in user can read profiles (the dashboard resolves customer
+    // names for bookings/customers). Writes are self-only; Role / isEnabled /
+    // salon_access are set exclusively by Cloud Functions.
+    match /Users/{userId} {
+      // Own profile; salon staff/admin may read (dashboard resolves customer names).
+      allow read: if isSignedIn() && (userId == uid() || isSalonRole() || isAdmin());
+      allow create: if isSignedIn() && userId == uid()
+        && request.resource.data.get('Role', 'USER') == 'USER'
+        && request.resource.data.get('isEnabled', true) == true
+        && !('salon_access' in request.resource.data);
+      allow update: if isSignedIn() && userId == uid()
+        && frozen(['Role', 'isEnabled', 'salon_access']);
+      allow delete: if isSignedIn() && userId == uid();
+    }
+
+    // ── salons (+ subcollections) ──────────────────────────────────────────────
+    match /salons/{salonId} {
+      allow read: if true; // public directory
+      allow create, delete: if isAdmin();
+      // Admin edits anything; salon staff edit but cannot touch derived/ownership.
+      allow update: if isAdmin() || (
+        isSalonStaff(salonId) &&
+        frozen(['owner_uid', 'avg_rating', 'review_count', 'is_verified', 'team_uids'])
+      );
+
+      match /services/{serviceId} {
+        allow read: if true;
+        allow write: if isSalonStaff(salonId) || isAdmin();
+      }
+      match /stylists/{stylistId} {
+        allow read: if true;
+        allow write: if isSalonStaff(salonId) || isAdmin();
+      }
+      match /blocked_slots/{slotId} {
+        allow read: if true; // availability
+        allow write: if isSalonStaff(salonId) || isAdmin();
+      }
+      match /stylist_stats/{stylistId} {
+        allow read: if isSalonStaff(salonId) || isAdmin();
+        allow write: if isSalonStaff(salonId) || isAdmin(); // written by completion flow
+      }
+      // Team roster & CutQ remittances are written only by Cloud Functions.
+      match /team/{memberId} {
+        allow read: if isSalonStaff(salonId) || isAdmin();
+        allow write: if false;
+      }
+      match /cutq_remittances/{docId} {
+        allow read: if isSalonStaff(salonId) || isAdmin();
+        allow write: if false;
+      }
+    }
+
+    // ── bookings ───────────────────────────────────────────────────────────────
+    match /bookings/{bookingId} {
+      // The customer app computes slot availability by reading a salon's bookings
+      // for a day (other users' bookings), so any signed-in user may READ bookings.
+      // (Rules can't field-filter; the privacy-preserving alternative is a non-PII
+      // occupancy aggregate — see notes.) Writes stay strictly scoped below.
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && (
+        // end-user booking themselves (must start pending)
+        (request.resource.data.user_id == uid() && request.resource.data.status == 'pending')
+        // salon staff recording a walk-in for their own salon
+        || isSalonStaff(request.resource.data.salon_id)
+      );
+      // The booking's user (cancel) or the salon's staff (confirm/complete/etc).
+      allow update: if isSignedIn() && (
+        resource.data.user_id == uid() || isSalonStaff(resource.data.salon_id)
+      );
+      allow delete: if false;
+    }
+
+    // ── reviews (aggregated into ratings by Cloud Functions) ─────────────────────
+    match /salon_reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isSignedIn()
+        && request.resource.data.user_id == uid() && isImageRating();
+      allow update, delete: if false;
+    }
+    match /service_reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isSignedIn()
+        && request.resource.data.user_id == uid() && isImageRating();
+      allow update, delete: if false;
+    }
+
+    // ── catalog / admin-managed content ──────────────────────────────────────────
+    match /service_categories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /service_subcategories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /explore_section/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /support/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Denormalized lookup indexes (doc id: "<salonId>_<catOrSubId>"), maintained
+    // by salon staff when they add/remove services.
+    match /salon_category_index/{id} {
+      allow read: if true;
+      allow write: if isSalonRole() || isAdmin();
+    }
+    match /salon_subcategory_index/{id} {
+      allow read: if true;
+      allow write: if isSalonRole() || isAdmin();
+    }
+
+    // ── app_config ───────────────────────────────────────────────────────────────
+    // settings (booking fee) + header images are public; invoice_counter is
+    // server-only (written by the ledger function via Admin SDK).
+    match /app_config/{docId} {
+      allow read: if docId == 'settings' || docId == 'header';
+      allow write: if isAdmin();
+    }
+
+    // ── issue reports ────────────────────────────────────────────────────────────
+    // Categories are admin-managed and read by the app to populate the form.
+    match /report_categories/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+    // A user files their own report; they can read their own tickets, admin reads all.
+    // Status changes (resolve) are admin-only.
+    match /reports/{reportId} {
+      allow read: if isSignedIn() && (resource.data.user_id == uid() || isAdmin());
+      allow create: if isSignedIn()
+        && request.resource.data.user_id == uid()
+        && request.resource.data.category_id is string
+        && request.resource.data.description is string;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+    // Notification-recipient config — admin only (also read server-side by functions).
+    match /report_config/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ── server-only (holds salon ledger credentials) ─────────────────────────────
+    match /ledger_accounts/{docId} {
+      allow read, write: if false;
+    }
+
+    // ── default deny ─────────────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

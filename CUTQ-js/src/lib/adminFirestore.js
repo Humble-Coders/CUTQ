@@ -573,3 +573,69 @@ export async function savePrivacyPolicy(type, html) {
   const id = type === "salon" ? "privacy_policy_salon" : "privacy_policy_user";
   await setDoc(supportDocRef(id), { html, updated_at: serverTimestamp() }, { merge: true });
 }
+
+// ─── Customer Support Representative (callables) ──────────────────────
+export async function supportListBookings(max = 500) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "supportListBookings");
+  const res = await call({ limit: max });
+  return res.data?.bookings ?? [];
+}
+
+// target: "salon" | "customer"; returns { support_called_salon, support_called_customer }
+export async function markSupportCall(bookingId, target, done) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "markSupportCall");
+  const res = await call({ bookingId, target, done });
+  return res.data;
+}
+
+// returns { uid, email, password, isExisting }
+export async function createSupportRep(email, name, phone) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "createSupportRep");
+  const res = await call({ email, name, phone });
+  return res.data;
+}
+
+// ─── Issue reports ────────────────────────────────────────────────────
+export function listenReportCategories(callback) {
+  const _db = requireDb();
+  const q = query(collection(_db, "report_categories"), orderBy("order"));
+  return onSnapshot(q, snap => callback(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+}
+
+export async function addReportCategory(name, order = 0) {
+  const _db = requireDb();
+  const ref = doc(collection(_db, "report_categories"));
+  await setDoc(ref, { name: name.trim(), is_active: true, order, created_at: serverTimestamp() });
+}
+
+export async function updateReportCategory(id, data) {
+  await updateDoc(doc(requireDb(), "report_categories", id), { ...data, updated_at: serverTimestamp() });
+}
+
+export async function deleteReportCategory(id) {
+  await deleteDoc(doc(requireDb(), "report_categories", id));
+}
+
+export function listenReportConfig(callback) {
+  const _db = requireDb();
+  return onSnapshot(doc(_db, "report_config", "settings"), snap =>
+    callback(snap.exists() ? snap.data() : { notify_emails: [] }));
+}
+
+export async function saveReportNotifyEmails(emails) {
+  await setDoc(doc(requireDb(), "report_config", "settings"),
+    { notify_emails: emails, updated_at: serverTimestamp() }, { merge: true });
+}
+
+export function listenReports(callback) {
+  const _db = requireDb();
+  const q = query(collection(_db, "reports"), orderBy("created_at", "desc"));
+  return onSnapshot(q, snap => callback(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+}
+
+export async function updateReportStatus(id, status) {
+  await updateDoc(doc(requireDb(), "reports", id), { status, updated_at: serverTimestamp() });
+}

@@ -14,8 +14,10 @@ async function getUserProfile(uid) {
   return null;
 }
 
-function isAdminEnabled(profile) {
-  return profile?.Role === "ADMIN" && profile?.isEnabled === true;
+// ADMIN and SUPPORT (customer support rep) may sign into the panel. SUPPORT is
+// restricted to the Bookings section inside AdminPanel.
+function canAccessPanel(profile) {
+  return (profile?.Role === "ADMIN" || profile?.Role === "SUPPORT") && profile?.isEnabled === true;
 }
 
 function AuthCard({ children }) {
@@ -92,7 +94,7 @@ export default function AdminAuth() {
   const [checkingProfile, setCheckingProfile] = useState(false);
   const [profile, setProfile] = useState(null);
 
-  const canAccess = useMemo(() => isAdminEnabled(profile), [profile]);
+  const canAccess = useMemo(() => canAccessPanel(profile), [profile]);
 
   useEffect(() => {
     if (!auth) return;
@@ -109,9 +111,9 @@ export default function AdminAuth() {
       try {
         const p = await getUserProfile(authState.user.uid);
         setProfile(p);
-        if (!isAdminEnabled(p)) {
+        if (!canAccessPanel(p)) {
           await signOut(auth);
-          toast.error("Access denied: admin not enabled");
+          toast.error("Access denied: account not enabled");
         }
       } catch (err) {
         console.error(err);
@@ -159,7 +161,7 @@ export default function AdminAuth() {
           Sign out
         </button>
       </div>
-      <AdminPanel />
+      <AdminPanel role={profile?.Role} />
     </div>
   );
 }

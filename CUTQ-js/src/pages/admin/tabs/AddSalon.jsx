@@ -95,7 +95,7 @@ export default function AddSalon() {
           body: JSON.stringify({ data: { email: ownerEmail.trim(), name: ownerName.trim(), phone: ownerPhone.trim() } }),
         }
       );
-      // The function may return a non-JSON body on an unexpected crash — read text
+      // The function may return a non-JSON body on an unexpected crash - read text
       // first so we can surface a useful message instead of a JSON parse error.
       const raw = await fnRes.text();
       let fnJson = {};
@@ -110,7 +110,7 @@ export default function AddSalon() {
       if (!ownerUid) throw new Error("Owner account was not created (no UID returned).");
       setCreatingOwner(false);
 
-      // all file uploads (logo + cover + gallery) happen in parallel — single updateDoc
+      // all file uploads (logo + cover + gallery) happen in parallel - single updateDoc
       const id = await addSalonFull(
         { ...form, owner_uid: ownerUid, location: { lat, lng }, working_hours: hours },
         logoFile,
@@ -121,7 +121,7 @@ export default function AddSalon() {
       const ownerNote = fnJson.result?.isExistingOwner
         ? " (linked to existing owner account)"
         : fnJson.result?.emailSent === false
-          ? " (owner created — welcome email could not be sent)"
+          ? " (owner created - welcome email could not be sent)"
           : "";
       toast.success(`Salon added!${ownerNote} ID: ${id}`);
       setForm({

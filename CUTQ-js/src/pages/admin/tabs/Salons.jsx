@@ -139,7 +139,7 @@ function EditSalonDrawer({ salon, onClose }) {
       <div className="w-full max-w-xl bg-[#0f0f0f] border-l border-white/10 flex flex-col h-full overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10 shrink-0">
-          <h2 className="text-sm font-semibold text-white">Edit — {salon.name}</h2>
+          <h2 className="text-sm font-semibold text-white">Edit - {salon.name}</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-white"><X size={18} /></button>
         </div>
 
@@ -418,7 +418,7 @@ function SalonRow({ salon }) {
             ].map(({ label, value }) => (
               <div key={label}>
                 <p className="text-xs text-gray-500">{label}</p>
-                <p className="text-white break-all">{value || "—"}</p>
+                <p className="text-white break-all">{value || "-"}</p>
               </div>
             ))}
             {/* Working hours */}

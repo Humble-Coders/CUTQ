@@ -1681,6 +1681,69 @@ exports.onReportCreated = onDocumentCreated(
   },
 );
 
+// ── Partner requests ────────────────────────────────────────────────────────────
+//
+// The public CutQ landing page writes "Become a Partner" leads to
+// partner_requests/{id}. On create we email the same recipients configured for
+// issue reports (report_config/settings.notify_emails).
+
+exports.onPartnerRequestCreated = onDocumentCreated(
+  {document: "partner_requests/{requestId}", secrets: [SMTP_USER, SMTP_PASS]},
+  async (event) => {
+    const req = event.data?.data?.() || {};
+    const requestId = event.params.requestId;
+    const db = admin.firestore();
+
+    let emails = [];
+    try {
+      const cfg = await db.collection("report_config").doc("settings").get();
+      emails = Array.isArray(cfg.data()?.notify_emails) ? cfg.data().notify_emails.filter(Boolean) : [];
+    } catch (err) {
+      logger.error("onPartnerRequestCreated: failed to read report_config", err);
+    }
+    if (emails.length === 0) {
+      logger.info("onPartnerRequestCreated: no notify_emails configured — skipping email", {requestId});
+      return;
+    }
+
+    const smtpUser = SMTP_USER.value();
+    const smtpPass = SMTP_PASS.value();
+    if (!smtpUser || !smtpPass) {
+      logger.warn("onPartnerRequestCreated: SMTP not configured — skipping email", {requestId});
+      return;
+    }
+
+    const lines = [
+      `A new partner request was submitted on the CUTQ landing page.`,
+      ``,
+      `Salon: ${req.salon_name || "—"}`,
+      `Owner: ${req.owner_name || "—"}`,
+      `Phone: ${req.phone || "—"}`,
+      `Email: ${req.email || "—"}`,
+      `City: ${req.city || "—"}`,
+      ``,
+      `Message:`,
+      req.message || "(none)",
+      ``,
+      `Request ID: ${requestId}`,
+    ].join("\n");
+
+    try {
+      await nodemailer.createTransport({
+        host: "smtp.gmail.com", port: 465, secure: true, auth: {user: smtpUser, pass: smtpPass},
+      }).sendMail({
+        from: `"CUTQ Partners" <${smtpUser}>`,
+        to: emails.join(", "),
+        subject: `New partner request: ${req.salon_name || "Salon"} — CUTQ`,
+        text: lines,
+      });
+      logger.info("onPartnerRequestCreated: notification email sent", {requestId, recipients: emails.length});
+    } catch (err) {
+      logger.error("onPartnerRequestCreated: email failed", {requestId, err});
+    }
+  },
+);
+
 exports.onReportResolved = onDocumentUpdated(
   "reports/{reportId}",
   async (event) => {

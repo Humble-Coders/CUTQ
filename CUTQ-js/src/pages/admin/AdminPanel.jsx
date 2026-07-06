@@ -9,6 +9,7 @@ import Support from "./tabs/Support";
 import BookingsSupport from "./tabs/BookingsSupport";
 import SupportReps from "./tabs/SupportReps";
 import Reports from "./tabs/Reports";
+import PartnerRequests from "./tabs/PartnerRequests";
 import { listenAppConfig, updateBookingFee } from "../../lib/adminFirestore";
 
 const ADMIN_TABS = [
@@ -18,6 +19,7 @@ const ADMIN_TABS = [
   { id: "bookings",        label: "Bookings" },
   { id: "support_reps",    label: "Support Reps" },
   { id: "reports",         label: "Reports" },
+  { id: "partner_requests", label: "Partner Requests" },
   { id: "header_images",   label: "Header Images" },
   { id: "explore_section", label: "Explore Section" },
   { id: "support",         label: "Support" },
@@ -105,6 +107,7 @@ export default function AdminPanel({ role }) {
           {tab === "bookings"        && <BookingsSupport />}
           {tab === "support_reps"    && !isSupport && <SupportReps />}
           {tab === "reports"         && !isSupport && <Reports />}
+          {tab === "partner_requests" && !isSupport && <PartnerRequests />}
           {tab === "header_images"   && !isSupport && <HeaderImages />}
           {tab === "explore_section" && !isSupport && <ExploreSection />}
           {tab === "support"         && !isSupport && <Support />}

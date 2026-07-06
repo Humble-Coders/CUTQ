@@ -639,3 +639,18 @@ export function listenReports(callback) {
 export async function updateReportStatus(id, status) {
   await updateDoc(doc(requireDb(), "reports", id), { status, updated_at: serverTimestamp() });
 }
+
+// ─── Partner requests (leads from the CutQ landing page) ───────────────
+export function listenPartnerRequests(callback) {
+  const _db = requireDb();
+  const q = query(collection(_db, "partner_requests"), orderBy("created_at", "desc"));
+  return onSnapshot(q, snap => callback(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+}
+
+export async function updatePartnerRequestStatus(id, status) {
+  await updateDoc(doc(requireDb(), "partner_requests", id), { status, updated_at: serverTimestamp() });
+}
+
+export async function deletePartnerRequest(id) {
+  await deleteDoc(doc(requireDb(), "partner_requests", id));
+}

@@ -225,7 +225,7 @@ function EmailsManager() {
 
   return (
     <div className="flex flex-col gap-3 max-w-md">
-      <p className="text-xs text-gray-500">Everyone here gets an email whenever a new report is filed.</p>
+      <p className="text-xs text-gray-500">Everyone here gets an email whenever a new report is filed or a new partner request comes in from the landing page.</p>
       <form onSubmit={add} className="flex gap-2">
         <input value={input} onChange={(e) => setInput(e.target.value)} type="email" placeholder="alerts@company.com"
           className="flex-1 bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]" />

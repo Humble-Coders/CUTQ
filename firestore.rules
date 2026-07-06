@@ -192,6 +192,35 @@ service cloud.firestore {
       allow read, write: if isAdmin();
     }
 
+    // ── partner requests (marketing site "Become a Partner" lead form) ───────────
+    // Public lead form: anyone (including anonymous website visitors) may create
+    // a request with a strictly-validated shape; only admins read/manage them.
+    // Written by the CutQ landing page; reviewed in the admin panel.
+    match /partner_requests/{id} {
+      allow create: if
+        request.resource.data.keys().hasOnly(
+          ['salon_name', 'owner_name', 'phone', 'email', 'city', 'message', 'status', 'created_at']
+        )
+        && request.resource.data.salon_name is string
+        && request.resource.data.salon_name.size() > 1
+        && request.resource.data.salon_name.size() < 120
+        && request.resource.data.owner_name is string
+        && request.resource.data.owner_name.size() > 1
+        && request.resource.data.owner_name.size() < 120
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() >= 6
+        && request.resource.data.phone.size() < 20
+        && request.resource.data.email is string
+        && request.resource.data.email.size() < 200
+        && request.resource.data.city is string
+        && request.resource.data.city.size() < 120
+        && request.resource.data.message is string
+        && request.resource.data.message.size() < 2000
+        && request.resource.data.status == 'new'
+        && request.resource.data.created_at == request.time;
+      allow read, update, delete: if isAdmin();
+    }
+
     // ── server-only (holds salon ledger credentials) ─────────────────────────────
     match /ledger_accounts/{docId} {
       allow read, write: if false;

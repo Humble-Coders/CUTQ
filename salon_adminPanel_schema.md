@@ -657,3 +657,32 @@ changed (resolve) by admin only; never deleted by clients.
 **Cloud Functions:** `onReportCreated` emails `report_config.notify_emails` on a
 new report; `onReportResolved` sends the reporter an FCM push when `status`
 becomes `"resolved"`.
+
+
+---
+
+## `partner_requests`
+
+**Document ID:** auto-generated
+
+Leads captured by the public **CutQ landing page** "Become a Partner" form. A
+salon owner submits their details; the CutQ team follows up to onboard them.
+Anyone (including anonymous website visitors) can **create** a request with a
+validated shape; only **admins** can read or manage them.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `salon_name` | string | Required; 2–119 chars |
+| `owner_name` | string | Required; 2–119 chars |
+| `phone` | string | Required; 6–19 chars |
+| `email` | string | Optional; `< 200` chars (`""` if omitted) |
+| `city` | string | Optional; `< 120` chars (`""` if omitted) |
+| `message` | string | Optional free text; `< 2000` chars (`""` if omitted) |
+| `status` | string | Fixed `"new"` on create; admin updates to e.g. `"contacted"` / `"onboarded"` / `"rejected"` |
+| `created_at` | timestamp | Must equal `request.time` (server timestamp) |
+
+**Written by:** CutQ landing page (public create). **Read/managed by:** Admin
+panel only. Suggested admin surface: a "Partner requests" / leads inbox.
+
+**Security rule:** create is public with a strict field whitelist + validation;
+`read`, `update`, `delete` are `isAdmin()` only.

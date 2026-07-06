@@ -1,6 +1,6 @@
 const {setGlobalOptions} = require("firebase-functions/v2");
 const {onRequest, onCall, HttpsError} = require("firebase-functions/v2/https");
-const {onDocumentCreated, onDocumentUpdated} = require("firebase-functions/v2/firestore");
+const {onDocumentCreated, onDocumentUpdated, onDocumentWritten} = require("firebase-functions/v2/firestore");
 const {defineSecret} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
@@ -18,6 +18,32 @@ setGlobalOptions({maxInstances: 10});
 admin.initializeApp();
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// Recompute a user's Storage-authorization custom claims from Firestore and
+// write them to the Auth token. Storage rules read these (request.auth.token)
+// because cross-service Firestore reads don't evaluate in this project's rules.
+//   role   = Users/{uid}.Role  ("ADMIN" | "SALONOWNER" | "SALONTEAM" | "SUPPORT")
+//   salons = ids of salons the user owns or is a team member of
+// NOTE: claims only take effect after the user's next sign-in / token refresh.
+async function refreshUserClaims(uid) {
+  if (!uid) return null;
+  const db = admin.firestore();
+  const [userSnap, ownedSnap, teamSnap] = await Promise.all([
+    db.collection("Users").doc(uid).get(),
+    db.collection("salons").where("owner_uid", "==", uid).get(),
+    db.collection("salons").where("team_uids", "array-contains", uid).get(),
+  ]);
+  const role = userSnap.exists ? (userSnap.data().Role || "") : "";
+  const salons = Array.from(new Set([
+    ...ownedSnap.docs.map((d) => d.id),
+    ...teamSnap.docs.map((d) => d.id),
+  ]));
+  const claims = {};
+  if (role) claims.role = role;
+  if (salons.length) claims.salons = salons;
+  await admin.auth().setCustomUserClaims(uid, claims);
+  return claims;
+}
 
 function setCorsHeaders(res) {
   res.set("Access-Control-Allow-Origin", "*");
@@ -136,6 +162,29 @@ function buildEmailHtml(displayName, email, password) {
 </html>`;
 }
 
+// Keep Storage-authorization claims (role + salons) in sync whenever a salon's
+// ownership or team changes — covers admin creating a salon (owner_uid set),
+// team add/remove, and owner reassignment. Affected users must re-login to pick
+// up the refreshed token.
+exports.onSalonWrittenSyncClaims = onDocumentWritten(
+  "salons/{salonId}",
+  async (event) => {
+    const before = event.data?.before?.data?.() || {};
+    const after = event.data?.after?.data?.() || {};
+    const uids = new Set();
+    [before.owner_uid, after.owner_uid].forEach((u) => u && uids.add(u));
+    (Array.isArray(before.team_uids) ? before.team_uids : []).forEach((u) => u && uids.add(u));
+    (Array.isArray(after.team_uids) ? after.team_uids : []).forEach((u) => u && uids.add(u));
+    for (const uid of uids) {
+      try {
+        await refreshUserClaims(uid);
+      } catch (err) {
+        logger.error("onSalonWrittenSyncClaims: refresh failed", {uid, err});
+      }
+    }
+  },
+);
+
 // ── Cloud Function ────────────────────────────────────────────────────────────
 
 exports.createSalonOwner = onRequest(
@@ -234,6 +283,14 @@ exports.createSalonOwner = onRequest(
         profileData.created_at = admin.firestore.FieldValue.serverTimestamp();
       }
       await admin.firestore().collection("Users").doc(uid).set(profileData, {merge: true});
+
+      // Set Storage-auth claims now (role); salon ids are added by the
+      // onSalonWrittenSyncClaims trigger once the salon doc is created.
+      try {
+ await refreshUserClaims(uid);
+} catch (err) {
+ logger.error("createSalonOwner: claim set failed", {uid, err});
+}
 
       // ── Send the welcome email — NON-FATAL ───────────────────────────────────
       // Email delivery must never block salon creation: the account already exists
@@ -1281,6 +1338,12 @@ exports.createSupportRep = onCall(async (request) => {
     created_at: admin.firestore.FieldValue.serverTimestamp(),
   }, {merge: true});
 
+  try {
+ await refreshUserClaims(uid);
+} catch (err) {
+ logger.error("createSupportRep: claim set failed", {uid, err});
+}
+
   return {uid, email: cleanEmail, password, isExisting};
 });
 
@@ -1556,6 +1619,12 @@ exports.addSalonTeamMember = onCall({secrets: [SMTP_USER, SMTP_PASS]}, async (re
   batch.update(db.collection("salons").doc(salonId), {team_uids: admin.firestore.FieldValue.arrayUnion(uid)});
   await batch.commit();
 
+  try {
+ await refreshUserClaims(uid);
+} catch (err) {
+ logger.error("addSalonTeamMember: claim set failed", {uid, err});
+}
+
   let emailSent = false;
   if (!isExisting) {
     try {
@@ -1616,6 +1685,11 @@ exports.removeSalonTeamMember = onCall(async (request) => {
   await db.collection("salons").doc(salonId).collection("team").doc(memberUid).delete();
   await db.collection("salons").doc(salonId).update({team_uids: admin.firestore.FieldValue.arrayRemove(memberUid)});
   await db.collection("Users").doc(memberUid).update({[`salon_access.${salonId}`]: admin.firestore.FieldValue.delete()});
+  try {
+ await refreshUserClaims(memberUid);
+} catch (err) {
+ logger.error("removeSalonTeamMember: claim set failed", {memberUid, err});
+}
   return {success: true};
 });
 

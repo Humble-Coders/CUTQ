@@ -5,25 +5,30 @@ rules_version = '2';
 // All media is publicly readable (salon logos, service photos, category icons,
 // header images are shown in the customer app). Writes are restricted to the
 // relevant salon staff / admin, and constrained to reasonably-sized images.
+//
+// Authorization uses CUSTOM AUTH CLAIMS (request.auth.token), NOT cross-service
+// Firestore reads: cross-service rules (firestore.get/exists from Storage rules)
+// do not evaluate on this project, so every Firestore-gated write was being
+// denied. Claims are maintained by Cloud Functions (see refreshUserClaims /
+// onSalonWrittenSyncClaims in functions/index.js):
+//   token.role   = "ADMIN" | "SALONOWNER" | "SALONTEAM" | "SUPPORT"
+//   token.salons = [salonId, ...]  (salons the user owns or is a team member of)
+// Note: claims only appear in a user's token after their next sign-in / token
+// refresh.
 service firebase.storage {
   match /b/{bucket}/o {
 
     function isSignedIn() { return request.auth != null; }
     function uid() { return request.auth.uid; }
 
-    function userRole() {
-      return isSignedIn()
-        && firestore.exists(/databases/(default)/documents/Users/$(uid()))
-        ? firestore.get(/databases/(default)/documents/Users/$(uid())).data.Role : '';
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.role == 'ADMIN';
     }
-    function isAdmin() { return userRole() == 'ADMIN'; }
 
-    function isSalonStaff(salonId) {
-      let p = /databases/(default)/documents/salons/$(salonId);
-      return isSignedIn() && firestore.exists(p) && (
-        firestore.get(p).data.owner_uid == uid() ||
-        (firestore.get(p).data.team_uids is list && uid() in firestore.get(p).data.team_uids)
-      );
+    function managesSalon(salonId) {
+      return isSignedIn()
+        && request.auth.token.salons is list
+        && salonId in request.auth.token.salons;
     }
 
     function validImage() {
@@ -34,7 +39,7 @@ service firebase.storage {
     // Salon media: logo, cover, gallery, service & stylist photos.
     match /salons/{salonId}/{allPaths=**} {
       allow read: if true;
-      allow write: if validImage() && (isSalonStaff(salonId) || isAdmin());
+      allow write: if validImage() && (isAdmin() || managesSalon(salonId));
     }
 
     // Admin-managed catalog media.

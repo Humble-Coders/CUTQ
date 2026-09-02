@@ -61,7 +61,8 @@ function ReportsList() {
     return reports.filter((r) => {
       if (status && (r.status || "open") !== status) return false;
       if (q) {
-        const hay = `${r.category_name} ${r.description} ${r.user_name} ${r.booking_brief?.salon_name || ""}`.toLowerCase();
+        const reported = (r.reported_services || []).map((s) => s.service_name || "").join(" ");
+        const hay = `${r.category_name} ${r.description} ${r.user_name} ${r.booking_brief?.salon_name || ""} ${reported}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -116,6 +117,13 @@ function ReportCard({ r, onResolve }) {
         <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${resolved ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-amber-500/15 text-amber-300 border-amber-500/30"}`}>
           {resolved ? "Resolved" : "Open"}
         </span>
+        {r.category_requires_service && !r.reported_services?.length && (
+          <span
+            title="Filed under a category that requires a service, but none was attached — most likely an older app version"
+            className="text-[11px] font-semibold px-2 py-0.5 rounded-full border bg-rose-500/15 text-rose-300 border-rose-500/30">
+            No service{r.app_version ? ` (app v${r.app_version})` : ""}
+          </span>
+        )}
         <span className="ml-auto text-[11px] text-gray-500">{fmt(r.created_at)}</span>
       </div>
       <p className="text-sm text-gray-200 whitespace-pre-wrap">{r.description}</p>
@@ -132,9 +140,19 @@ function ReportCard({ r, onResolve }) {
           {open && (
             <div className="mt-1.5 pl-2 text-gray-400">
               <div>ID: <span className="font-mono text-gray-300">{r.booking_id}</span></div>
-              {r.booking_brief?.services?.length > 0 && (
-                <div className="mt-0.5">Services: {r.booking_brief.services.map((s) => s.service_name || s.name).join(", ")}</div>
+              {r.reported_services?.length > 0 && (
+                <div className="mt-0.5">
+                  Reported service{r.reported_services.length > 1 ? "s" : ""}:{" "}
+                  <span className="text-gray-200">{r.reported_services.map((s) => s.service_name).join(", ")}</span>
+                </div>
               )}
+              {r.booking_brief?.services?.length > 0 && (
+                <div className="mt-0.5 text-gray-500">
+                  {r.reported_services?.length > 0 ? "Whole booking" : "Services"}:{" "}
+                  {r.booking_brief.services.map((s) => s.service_name || s.name).join(", ")}
+                </div>
+              )}
+              {r.platform && <div className="mt-0.5 text-gray-500">Filed from {r.platform}{r.app_version ? ` v${r.app_version}` : ""}</div>}
             </div>
           )}
         </div>
@@ -156,6 +174,7 @@ function ReportCard({ r, onResolve }) {
 function CategoriesManager() {
   const [cats, setCats] = useState([]);
   const [name, setName] = useState("");
+  const [requiresService, setRequiresService] = useState(false);
   const [adding, setAdding] = useState(false);
 
   useEffect(() => listenReportCategories(setCats), []);
@@ -165,20 +184,28 @@ function CategoriesManager() {
     if (!name.trim()) return;
     setAdding(true);
     try {
-      await addReportCategory(name, cats.length);
+      await addReportCategory(name, cats.length, requiresService);
       setName("");
+      setRequiresService(false);
     } catch (err) { console.error(err); toast.error("Failed to add category"); }
     finally { setAdding(false); }
   }
 
   return (
     <div className="flex flex-col gap-3 max-w-md">
-      <form onSubmit={add} className="flex gap-2">
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="New category name"
-          className="flex-1 bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]" />
-        <button type="submit" disabled={adding} className="flex items-center gap-1.5 px-3 py-2 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-50">
-          {adding ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />} Add
-        </button>
+      <form onSubmit={add} className="flex flex-col gap-2">
+        <div className="flex gap-2">
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="New category name"
+            className="flex-1 bg-white/10 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-gray-500 outline-none focus:border-[#18B79B]" />
+          <button type="submit" disabled={adding} className="flex items-center gap-1.5 px-3 py-2 text-sm rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-50">
+            {adding ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />} Add
+          </button>
+        </div>
+        <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+          <input type="checkbox" checked={requiresService} onChange={(e) => setRequiresService(e.target.checked)}
+            className="accent-[#18B79B]" />
+          Require service selection
+        </label>
       </form>
       {cats.length === 0 ? (
         <p className="text-xs text-gray-500">No categories yet.</p>
@@ -186,6 +213,11 @@ function CategoriesManager() {
         <div key={c.id} className="flex items-center gap-3 bg-white/5 border border-white/10 rounded px-3 py-2">
           <span className={`text-sm ${c.is_active ? "text-white" : "text-gray-500 line-through"}`}>{c.name}</span>
           <div className="ml-auto flex items-center gap-2">
+            <button onClick={() => updateReportCategory(c.id, { requires_service: !c.requires_service })}
+              title="Users picking this category must attach a booking and choose the service they are reporting"
+              className={`text-[10px] px-2 py-0.5 rounded-full border ${c.requires_service ? "bg-[#18B79B]/15 text-[#18B79B] border-[#18B79B]/30" : "bg-gray-500/15 text-gray-400 border-gray-500/30"}`}>
+              {c.requires_service ? "Service required" : "Service optional"}
+            </button>
             <button onClick={() => updateReportCategory(c.id, { is_active: !c.is_active })}
               className={`text-[10px] px-2 py-0.5 rounded-full border ${c.is_active ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-gray-500/15 text-gray-400 border-gray-500/30"}`}>
               {c.is_active ? "Active" : "Hidden"}
@@ -195,6 +227,11 @@ function CategoriesManager() {
           </div>
         </div>
       ))}
+      <p className="text-[11px] text-gray-500 leading-relaxed">
+        Users on older app versions won't be asked for a service — those tickets arrive
+        flagged "No service" with the app version, so you can follow up. Turn "Service
+        required" on once the new build has real adoption.
+      </p>
     </div>
   );
 }

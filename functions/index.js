@@ -1522,6 +1522,7 @@ exports.createSupportRep = onCall(async (request) => {
 // Each call is authorized as the salon owner (or an ADMIN). See ledger.js.
 
 // Verify the caller owns `salonId` (or is an ADMIN). Returns the salon data.
+// Owner-only — team management must never be delegable, so this stays strict.
 async function assertSalonOwner(auth, salonId) {
   if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
   if (!salonId) throw new HttpsError("invalid-argument", "salonId is required.");
@@ -1537,9 +1538,31 @@ async function assertSalonOwner(auth, salonId) {
   return salon;
 }
 
+// Owner, ADMIN, or an active team member holding `moduleId` for this salon.
+// The dashboard already gates its nav on the same grant (Layout.jsx NAV_ITEMS),
+// so without this every ledger call from a team member was refused even when the
+// owner had granted them the module.
+async function assertSalonAccess(auth, salonId, moduleId) {
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+  if (!salonId) throw new HttpsError("invalid-argument", "salonId is required.");
+  const snap = await admin.firestore().collection("salons").doc(salonId).get();
+  if (!snap.exists) throw new HttpsError("not-found", "Salon not found.");
+  const salon = snap.data();
+  if (salon.owner_uid === auth.uid) return salon;
+
+  const prof = await getUserProfile(auth.uid);
+  if (String(prof?.Role || "").toUpperCase() === "ADMIN") return salon;
+
+  const access = prof?.salon_access?.[salonId];
+  const granted = Array.isArray(access?.modules) && access.modules.includes(moduleId);
+  if (access && access.is_active !== false && granted) return salon;
+
+  throw new HttpsError("permission-denied", "Not authorized for this salon.");
+}
+
 exports.ledgerProvisionSalon = onCall(async (request) => {
   const {salonId} = request.data || {};
-  await assertSalonOwner(request.auth, salonId);
+  await assertSalonAccess(request.auth, salonId, "accounts");
   const rec = await ledger.provisionSalon(salonId);
   return {provisioned: true, companyId: rec.companyId || null, accounts: rec.accounts};
 });
@@ -1551,26 +1574,37 @@ exports.ledgerRecordSale = onCall(async (request) => {
   const bsnap = await bref.get();
   if (!bsnap.exists) throw new HttpsError("not-found", "Booking not found.");
   const booking = bsnap.data();
-  await assertSalonOwner(request.auth, booking.salon_id);
+  // Completion (and its retry) lives on the Bookings page.
+  await assertSalonAccess(request.auth, booking.salon_id, "bookings");
   if (booking.status !== "completed") {
     throw new HttpsError("failed-precondition", "Booking is not completed.");
   }
   if (booking.ledger?.posted) return {alreadyPosted: true, ledger: booking.ledger};
+  // Re-posting a reversed booking would replay the SAME (appId, sourceId) and get
+  // the original — now reversed — transactions back, leaving the booking marked
+  // posted while the books still show the reversal.
+  if (booking.ledger?.reversed) {
+    throw new HttpsError("failed-precondition",
+      "This booking's accounting entry was reversed and cannot be re-posted.");
+  }
 
   // Claim a short-lived posting lock to avoid double-posting on rapid retries.
-  const claimed = await admin.firestore().runTransaction(async (tx) => {
+  const claim = await admin.firestore().runTransaction(async (tx) => {
     const s = await tx.get(bref);
+    if (!s.exists) return "missing";
     const l = s.data().ledger || {};
-    if (l.posted) return false;
+    if (l.posted) return "posted";
     const lockedAt = l.posting_at?.toMillis?.() || 0;
-    if (l.posting && Date.now() - lockedAt < 60000) return false;
+    if (l.posting && Date.now() - lockedAt < 60000) return "busy";
     tx.set(bref, {ledger: {...l, posting: true, posting_at: admin.firestore.FieldValue.serverTimestamp()}}, {merge: true});
-    return true;
+    return "claimed";
   });
-  if (!claimed) throw new HttpsError("aborted", "Posting already in progress.");
+  if (claim === "missing") throw new HttpsError("not-found", "Booking was deleted.");
+  if (claim === "posted") return {alreadyPosted: true};
+  if (claim !== "claimed") throw new HttpsError("aborted", "Posting already in progress.");
 
   try {
-    const refs = await ledger.recordSaleForBooking(bookingId);
+    const refs = await ledger.recordSaleForBooking(bookingId, {actorUid: request.auth?.uid});
     const update = {
       ledger: {...refs, posted: true, posting: false, error: null,
         posted_at: admin.firestore.FieldValue.serverTimestamp()},
@@ -1592,52 +1626,72 @@ exports.ledgerRecordSale = onCall(async (request) => {
 });
 
 exports.ledgerReverseSale = onCall(async (request) => {
-  const {bookingId} = request.data || {};
+  const {bookingId, reason} = request.data || {};
   const bref = admin.firestore().collection("bookings").doc(bookingId);
   const bsnap = await bref.get();
   if (!bsnap.exists) throw new HttpsError("not-found", "Booking not found.");
   const booking = bsnap.data();
-  await assertSalonOwner(request.auth, booking.salon_id);
+  await assertSalonAccess(request.auth, booking.salon_id, "accounts");
   if (!booking.ledger?.posted) return {reversed: false, reason: "not posted"};
-  const results = await ledger.reverseSaleForBooking(bookingId, booking.ledger);
+  const results = await ledger.reverseSaleForBooking(bookingId, booking.ledger, reason);
   await bref.set({ledger: {...booking.ledger, posted: false, reversed: true, reverse_results: results,
     reversed_at: admin.firestore.FieldValue.serverTimestamp()}}, {merge: true});
   return {reversed: true, results};
 });
 
+// A client-supplied idempotency key, reduced to a charset safe for a ledger
+// sourceId. Falls back to a timestamp when the caller sends none (older builds).
+function sourceIdFrom(prefix, clientRequestId) {
+  const clean = String(clientRequestId || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return `${prefix}_${clean || Date.now()}`;
+}
+
 exports.ledgerRecordExpense = onCall(async (request) => {
-  const {salonId, amount, expenseAccountId, paymentMethod, description, date} = request.data || {};
-  await assertSalonOwner(request.auth, salonId);
+  const {salonId, amount, expenseAccountId, paymentMethod, description, date, clientRequestId} = request.data || {};
+  await assertSalonAccess(request.auth, salonId, "accounts");
   if (!(Number(amount) > 0)) throw new HttpsError("invalid-argument", "amount must be > 0.");
   if (!description) throw new HttpsError("invalid-argument", "description is required.");
   const {cred} = await ledger.ensureSalonLedger(salonId);
   let expAcct = expenseAccountId;
   if (!expAcct) {
-    const accts = (await ledger.authed(cred, "/accounts", {query: {type: "EXPENSE", limit: 100}})).data || [];
+    expAcct = cred.accounts?.operatingExpense || null;
+  }
+  if (!expAcct) {
+    const accts = (await ledger.authed(cred, "/accounts", {query: {type: "EXPENSE", limit: 200}})).data || [];
     expAcct = (accts.find((a) => a.name === "Operating Expense") || accts[0] || {}).id;
   }
+  if (!expAcct) throw new HttpsError("failed-precondition", "No expense account is available for this salon.");
   const res = await ledger.authed(cred, "/expenses", {method: "POST", body: {
     amount: Number(amount), expenseAccountId: expAcct,
     paymentMethod: paymentMethod === "BANK" ? "BANK" : "CASH",
-    description, appId: ledger.APP_ID, sourceId: `exp_${Date.now()}`,
-    date: date || new Date().toISOString().slice(0, 10),
+    description, appId: ledger.APP_ID, sourceId: sourceIdFrom("exp", clientRequestId),
+    date: date || ledger.istDate(),
   }});
   return {success: true, txnId: res.data?.transaction?.id || null};
 });
 
 exports.ledgerRecordCutqRemittance = onCall(async (request) => {
-  const {salonId, amount, method, description, date} = request.data || {};
-  await assertSalonOwner(request.auth, salonId);
+  const {salonId, amount, method, description, date, clientRequestId} = request.data || {};
+  await assertSalonAccess(request.auth, salonId, "accounts");
   if (!(Number(amount) > 0)) throw new HttpsError("invalid-argument", "amount must be > 0.");
   const {cred} = await ledger.ensureSalonLedger(salonId);
-  const sourceId = `remit_${Date.now()}`;
+  const sourceId = sourceIdFrom("remit", clientRequestId);
+
+  // The ledger dedupes the payment itself; mirror that on the Firestore log so a
+  // replay doesn't inflate "remitted" (and therefore deflate "owed to CutQ").
+  const logRef = admin.firestore().collection("salons").doc(salonId)
+    .collection("cutq_remittances").doc(sourceId);
+  const priorLog = await logRef.get();
+  if (priorLog.exists) {
+    return {success: true, alreadyRecorded: true, txnId: priorLog.data()?.txnId || null};
+  }
   const res = await ledger.authed(cred, "/vendor-payments", {method: "POST", body: {
     vendorId: cred.cutqVendorId, amount: Number(amount),
     method: method === "BANK" ? "BANK" : "CASH",
     description: description || "CutQ booking-fee remittance",
-    appId: ledger.APP_ID, sourceId, date: date || new Date().toISOString().slice(0, 10),
+    appId: ledger.APP_ID, sourceId, date: date || ledger.istDate(),
   }});
-  await admin.firestore().collection("salons").doc(salonId).collection("cutq_remittances").add({
+  await logRef.set({
     amount: Number(amount), method: method === "BANK" ? "BANK" : "CASH",
     description: description || "CutQ booking-fee remittance",
     txnId: res.data?.transaction?.id || null, sourceId,
@@ -1650,7 +1704,7 @@ exports.ledgerRecordCutqRemittance = onCall(async (request) => {
 // bookings) − already remitted. Also returns the fee collected within [from,to].
 exports.ledgerCutqSummary = onCall(async (request) => {
   const {salonId, from, to} = request.data || {};
-  await assertSalonOwner(request.auth, salonId);
+  await assertSalonAccess(request.auth, salonId, "accounts");
   const db = admin.firestore();
   const snap = await db.collection("bookings")
     .where("salon_id", "==", salonId).where("status", "==", "completed").get();
@@ -1678,7 +1732,7 @@ exports.ledgerCutqSummary = onCall(async (request) => {
 // Read proxy for the Accounts section — dispatches to Humble Ledger read endpoints.
 exports.ledgerQuery = onCall(async (request) => {
   const {salonId, resource, params = {}} = request.data || {};
-  await assertSalonOwner(request.auth, salonId);
+  await assertSalonAccess(request.auth, salonId, "accounts");
   const {cred} = await ledger.ensureSalonLedger(salonId);
   const q = (path, query) => ledger.authed(cred, path, {query});
   switch (resource) {
@@ -1894,13 +1948,37 @@ exports.onReportCreated = onDocumentCreated(
       return;
     }
 
+    // Whether this category demands a service is resolved from the CATEGORY, not from the
+    // flag the client stamped on the report. App versions that predate the requirement send
+    // no flag at all, so trusting the report would make the "no service" notice below
+    // unreachable for exactly the old builds it exists to explain.
+    let requiresService = report.category_requires_service === true;
+    if (report.category_requires_service === undefined && report.category_id) {
+      try {
+        const cat = await db.collection("report_categories").doc(report.category_id).get();
+        requiresService = cat.data()?.requires_service === true;
+      } catch (err) {
+        logger.warn("onReportCreated: could not resolve category requires_service", err);
+      }
+    }
+    // Client-written and never validated by the rules, so treat the shape as untrusted.
+    const reportedServices = Array.isArray(report.reported_services) ?
+      report.reported_services.map((s) => s?.service_name).filter(Boolean) : [];
+
     const lines = [
       `A new issue was reported on CUTQ.`,
       ``,
       `Category: ${report.category_name || "—"}`,
       `Reported by: ${report.user_name || "Unknown"}${report.user_phone ? ` (${report.user_phone})` : ""}`,
+      `Filed from: ${report.platform || "app"} v${report.app_version || "?"}`,
       report.about_booking && report.booking_id ?
         `Related booking: ${report.booking_id}${report.booking_brief?.salon_name ? ` — ${report.booking_brief.salon_name}` : ""}` : null,
+      // The narrower list: what the user is actually complaining about. A ticket filed
+      // under a category that requires a service but carries none came from a build that
+      // predates the requirement — say so rather than letting support assume a bug.
+      reportedServices.length ?
+        `Service(s) reported: ${reportedServices.join(", ")}` :
+        (requiresService ? `Service(s) reported: (none — filed from an older app build)` : null),
       ``,
       `Description:`,
       report.description || "(none)",
@@ -1914,7 +1992,9 @@ exports.onReportCreated = onDocumentCreated(
       }).sendMail({
         from: `"CUTQ Reports" <${smtpUser}>`,
         to: emails.join(", "),
-        subject: `New issue reported: ${report.category_name || "General"} — CUTQ`,
+        subject: `New issue reported: ${report.category_name || "General"}${
+          reportedServices.length === 1 ? ` — ${reportedServices[0]}` : ""
+        } — CUTQ`,
         text: lines,
       });
       logger.info("onReportCreated: notification email sent", {reportId, recipients: emails.length});

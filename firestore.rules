@@ -171,7 +171,10 @@ service cloud.firestore {
     // settings (booking fee) + header images are public; invoice_counter is
     // server-only (written by the ledger function via Admin SDK).
     match /app_config/{docId} {
-      allow read: if docId == 'settings' || docId == 'header';
+      // search_lexicon holds the search synonyms and typo corrections the app merges over
+      // its baked-in defaults. Without it here the fetch fails silently and every device
+      // quietly falls back to the shipped lexicon, so admin edits would do nothing.
+      allow read: if docId == 'settings' || docId == 'header' || docId == 'search_lexicon';
       allow write: if isAdmin();
     }
 

@@ -605,10 +605,18 @@ export function listenReportCategories(callback) {
   return onSnapshot(q, snap => callback(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
 }
 
-export async function addReportCategory(name, order = 0) {
+export async function addReportCategory(name, order = 0, requiresService = false) {
   const _db = requireDb();
   const ref = doc(collection(_db, "report_categories"));
-  await setDoc(ref, { name: name.trim(), is_active: true, order, created_at: serverTimestamp() });
+  await setDoc(ref, {
+    name: name.trim(),
+    is_active: true,
+    order,
+    // Written explicitly so the field is visible in Firestore and the admin toggle never
+    // renders from `undefined`. The apps default it to false when absent.
+    requires_service: requiresService,
+    created_at: serverTimestamp(),
+  });
 }
 
 export async function updateReportCategory(id, data) {

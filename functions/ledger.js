@@ -290,21 +290,8 @@ async function registerCompany(salonId, salonName) {
   throw lastErr || new Error("Could not register a ledger company for this salon.");
 }
 
-// Copy a pre-v2 credential record aside so the retired company stays
-// identifiable. The live record is NOT touched here — the claim transaction
-// already replaced it, atomically, with the provisioning lock.
-async function archiveLegacyLedger(salonId, data) {
-  const archive = admin.firestore().collection("ledger_accounts_v1").doc(salonId);
-  const existing = await archive.get();
-  if (!existing.exists) {
-    await archive.set({
-      ...data,
-      archived_from: LEGACY_LEDGER_BASE,
-      archived_at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  }
-  if (data.email) tokenCache.delete(data.email);
-  logger.info("Archived pre-v2 ledger company; salon will be re-provisioned", {salonId});
+function archiveRef(salonId) {
+  return admin.firestore().collection("ledger_accounts_v1").doc(salonId);
 }
 
 function isCurrent(d) {
@@ -321,17 +308,33 @@ async function provisionSalon(salonId) {
 
   // Claim a provisioning lock so two concurrent first-sales don't both register
   // a company (which would orphan a duplicate we can't recover the password for).
-  // The same transaction retires a pre-v2 record: the write is a full replace
-  // (no merge), so the stale v1 email/password/accounts are gone the instant the
-  // lock is taken. Doing this outside the transaction would let a slow instance
-  // wipe a v2 record another instance had just finished writing.
+  //
+  // The same transaction retires a pre-v2 record. The lock write is a full
+  // replace (no merge), so the stale v1 email/password/accounts are gone the
+  // instant the lock is taken — which means the copy into ledger_accounts_v1 has
+  // to happen in the SAME transaction. Archiving afterwards would leave a window
+  // where a crash between the two writes loses the credentials for good, and
+  // doing either outside the transaction would let a slow instance wipe a v2
+  // record another instance had just finished writing.
+  const legacyRef = archiveRef(salonId);
   const claim = await admin.firestore().runTransaction(async (tx) => {
+    // Firestore requires every read before any write.
     const s = await tx.get(ref);
+    const priorArchive = await tx.get(legacyRef);
+
     const dd = s.exists ? s.data() : null;
     if (isCurrent(dd)) return {done: dd};
     const lockedAt = dd?.provisioning_at?.toMillis?.() || 0;
     if (dd?.provisioning && Date.now() - lockedAt < 120000) return {busy: true};
+
     const legacy = dd?.email && dd?.accounts ? dd : null;
+    if (legacy && !priorArchive.exists) {
+      tx.set(legacyRef, {
+        ...legacy,
+        archived_from: LEGACY_LEDGER_BASE,
+        archived_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
     tx.set(ref, {provisioning: true, provisioning_at: admin.firestore.FieldValue.serverTimestamp()});
     return {claimed: true, legacy};
   });
@@ -345,16 +348,18 @@ async function provisionSalon(salonId) {
     throw new Error("Ledger provisioning already in progress; please retry shortly.");
   }
 
-  // Lock is held — safe to file the retired record away.
-  if (claim.legacy) await archiveLegacyLedger(salonId, claim.legacy);
+  if (claim.legacy) {
+    tokenCache.delete(claim.legacy.email);
+    logger.info("Archived pre-v2 ledger company; salon will be re-provisioned", {salonId});
+  }
 
-  const salonSnap = await admin.firestore().collection("salons").doc(salonId).get();
-  if (!salonSnap.exists) throw new Error("Salon not found");
-  const salon = salonSnap.data();
-
+  // Everything from here on must release the lock if it throws, or the salon is
+  // stuck behind a held lock for two minutes with no credentials on file.
   let reg;
   try {
-    reg = await registerCompany(salonId, salon.name);
+    const salonSnap = await admin.firestore().collection("salons").doc(salonId).get();
+    if (!salonSnap.exists) throw new Error("Salon not found");
+    reg = await registerCompany(salonId, salonSnap.data().name);
   } catch (err) {
     // Clear the lock so it can be retried.
     await ref.set({provisioning: false}, {merge: true}).catch(() => {});

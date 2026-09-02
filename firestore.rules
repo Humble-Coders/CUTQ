@@ -263,6 +263,13 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Retired pre-v2 credentials, archived at the Humble Ledger v2 cutover. Same
+    // plaintext secrets as above, so it is denied explicitly rather than relying
+    // on the catch-all below surviving future edits.
+    match /ledger_accounts_v1/{docId} {
+      allow read, write: if false;
+    }
+
     // ── default deny ─────────────────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;

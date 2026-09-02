@@ -1,7 +1,6 @@
 const {setGlobalOptions} = require("firebase-functions/v2");
 const {onRequest, onCall, HttpsError} = require("firebase-functions/v2/https");
 const {onDocumentCreated, onDocumentUpdated, onDocumentWritten} = require("firebase-functions/v2/firestore");
-const {defineSecret} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
@@ -9,15 +8,29 @@ const crypto = require("crypto");
 const sharp = require("sharp");
 const ledger = require("./ledger");
 
-const SMTP_USER = defineSecret("SMTP_USER");
-const SMTP_PASS = defineSecret("SMTP_PASS");
-const PEXELS_API_KEY = defineSecret("PEXELS_API_KEY");
+const {SMTP_USER, SMTP_PASS, PEXELS_API_KEY} = require("./secrets");
 
 setGlobalOptions({maxInstances: 10});
 
 admin.initializeApp();
 
+// Explicit bucket — the project's only bucket is the *.firebasestorage.app one
+// (there is no legacy *.appspot.com bucket), so admin.storage().bucket() must be
+// given the name.
+const STORAGE_BUCKET = "cutq-e133a.firebasestorage.app";
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// Throws unless the caller is a signed-in ADMIN (Users/{uid}.Role === "ADMIN").
+async function assertAdmin(auth) {
+  const uid = auth && auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Sign in required.");
+  const snap = await admin.firestore().collection("Users").doc(uid).get();
+  if (!snap.exists || snap.data().Role !== "ADMIN") {
+    throw new HttpsError("permission-denied", "Admin access required.");
+  }
+  return uid;
+}
 
 // Recompute a user's Storage-authorization custom claims from Firestore and
 // write them to the Auth token. Storage rules read these (request.auth.token)
@@ -129,7 +142,7 @@ function buildEmailHtml(displayName, email, password) {
               <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
                 <tr>
                   <td>
-                    <a href="#"
+                    <a href="https://dashboard.cutqsalons.in/signin"
                       style="display:inline-block;background:#18B79B;color:#ffffff;font-size:15px;font-weight:600;
                              padding:14px 32px;border-radius:8px;text-decoration:none;letter-spacing:0.3px;">
                       Sign In to CUTQ &rarr;
@@ -184,6 +197,162 @@ exports.onSalonWrittenSyncClaims = onDocumentWritten(
     }
   },
 );
+
+// ── Password reset (sent by us, not Firebase Auth's mailer) ─────────────────────
+//
+// The dashboard "Forgot password" calls this. We generate a Firebase password-reset
+// link with the Admin SDK and email it ourselves via connect@cutqsalons.in, so all
+// outbound mail comes from a single branded address. Returns {ok:true} regardless of
+// whether the email is registered (don't leak account existence).
+function buildPasswordResetHtml(link) {
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 0;"><tr><td align="center">
+    <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
+      <tr><td style="background:#0a0a0a;padding:32px 40px;text-align:center;">
+        <div style="display:inline-flex;align-items:center;gap:10px;">
+          <div style="width:10px;height:10px;border-radius:50%;background:#18B79B;display:inline-block;"></div>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:0.5px;">CUTQ</span>
+        </div></td></tr>
+      <tr><td style="background:#ffffff;padding:40px;">
+        <h1 style="margin:0 0 8px;font-size:22px;font-weight:700;color:#09090b;">Reset your password</h1>
+        <p style="margin:0 0 28px;font-size:15px;color:#52525b;line-height:1.6;">
+          We received a request to reset your CutQ password. Click the button below to choose a new one. This link expires shortly for your security.
+        </p>
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;"><tr><td>
+          <a href="${link}" style="display:inline-block;background:#18B79B;color:#ffffff;font-size:15px;font-weight:600;padding:14px 32px;border-radius:8px;text-decoration:none;">Reset Password &rarr;</a>
+        </td></tr></table>
+        <p style="margin:0;font-size:13px;color:#a1a1aa;line-height:1.6;">If you didn't request this, you can safely ignore this email.</p>
+      </td></tr>
+      <tr><td style="background:#fafafa;padding:20px 40px;text-align:center;border-top:1px solid #eee;">
+        <p style="margin:0;font-size:12px;color:#a1a1aa;">CutQ &middot; connect@cutqsalons.in</p>
+      </td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`;
+}
+
+exports.sendPasswordReset = onCall(
+  {secrets: [SMTP_USER, SMTP_PASS]},
+  async (request) => {
+    const email = String(request.data?.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      throw new HttpsError("invalid-argument", "A valid email is required.");
+    }
+    const smtpUser = SMTP_USER.value();
+    const smtpPass = SMTP_PASS.value();
+    if (!smtpUser || !smtpPass) {
+      throw new HttpsError("failed-precondition", "Email service is not configured.");
+    }
+
+    let link;
+    try {
+      link = await admin.auth().generatePasswordResetLink(email);
+    } catch (err) {
+      // user-not-found / invalid — don't reveal, just no-op.
+      logger.info("sendPasswordReset: no link generated", {email, code: err.code});
+      return {ok: true};
+    }
+
+    try {
+      await nodemailer.createTransport({
+        host: "smtp.gmail.com", port: 465, secure: true, auth: {user: smtpUser, pass: smtpPass},
+      }).sendMail({
+        from: `"CutQ" <${smtpUser}>`,
+        to: email,
+        subject: "Reset your CutQ password",
+        text:
+          "Hello,\n\nWe received a request to reset your CutQ password. " +
+          "Use the link below to set a new password:\n\n" + link +
+          "\n\nIf you didn't request this, you can safely ignore this email.\n\n— CutQ",
+        html: buildPasswordResetHtml(link),
+      });
+      logger.info("sendPasswordReset: email sent", {email});
+    } catch (err) {
+      logger.error("sendPasswordReset: email failed", {email, err});
+      throw new HttpsError("internal", "Could not send the reset email. Please try again.");
+    }
+    return {ok: true};
+  },
+);
+
+// ── Salon delete (cascade) ──────────────────────────────────────────────────────
+// Admin-only. Deletes the salon doc + its subcollections (services, stylists, team,
+// blocked_slots) and its Storage images. Bookings are intentionally NOT deleted so
+// history is preserved.
+exports.deleteSalonCascade = onCall(async (request) => {
+  await assertAdmin(request.auth);
+  const salonId = String(request.data?.salonId || "").trim();
+  if (!salonId) throw new HttpsError("invalid-argument", "salonId is required.");
+  const db = admin.firestore();
+  await db.recursiveDelete(db.collection("salons").doc(salonId));
+  try {
+    await admin.storage().bucket(STORAGE_BUCKET).deleteFiles({prefix: `salons/${salonId}/`});
+  } catch (err) {
+    logger.error("deleteSalonCascade: storage delete failed", {salonId, err});
+  }
+  logger.info("deleteSalonCascade: done", {salonId});
+  return {ok: true};
+});
+
+// ── Copy onboarding-submission images into a salon's own storage ──────────────────
+// Admin-only. Called after a salon is created from a submission for the images the
+// admin kept (did not replace). Copies objects to salons/{salonId}/..., assigns a
+// fresh download token, and writes the URLs onto the salon doc.
+exports.importSubmissionImages = onCall(async (request) => {
+  await assertAdmin(request.auth);
+  const {submissionId, salonId, fields} = request.data || {};
+  if (!submissionId || !salonId) {
+    throw new HttpsError("invalid-argument", "submissionId and salonId are required.");
+  }
+  const db = admin.firestore();
+  const subSnap = await db.collection("salon_submissions").doc(String(submissionId)).get();
+  if (!subSnap.exists) throw new HttpsError("not-found", "Submission not found.");
+  const sub = subSnap.data();
+  const bucket = admin.storage().bucket(STORAGE_BUCKET);
+
+  async function copyOne(srcPath, destPath) {
+    const token = crypto.randomUUID();
+    await bucket.file(srcPath).copy(bucket.file(destPath));
+    await bucket.file(destPath).setMetadata({
+      contentType: "image/jpeg",
+      cacheControl: "public, max-age=31536000",
+      metadata: {firebaseStorageDownloadTokens: token},
+    });
+    return `https://firebasestorage.googleapis.com/v0/b/${STORAGE_BUCKET}/o/${encodeURIComponent(destPath)}?alt=media&token=${token}`;
+  }
+
+  const want = fields || {logo: true, cover: true, gallery: true};
+  const updates = {};
+  try {
+    if (want.logo && sub.logo_path) {
+      updates.logo_url = await copyOne(sub.logo_path, `salons/${salonId}/logo.jpg`);
+    }
+    if (want.cover && sub.cover_path) {
+      updates.cover_photo = await copyOne(sub.cover_path, `salons/${salonId}/cover.jpg`);
+    }
+    if (want.gallery && Array.isArray(sub.gallery) && sub.gallery.length) {
+      const gal = [];
+      for (let i = 0; i < sub.gallery.length; i++) {
+        const g = sub.gallery[i];
+        if (!g?.path) continue;
+        const id = crypto.randomUUID();
+        const url = await copyOne(g.path, `salons/${salonId}/gallery/${id}.jpg`);
+        gal.push({id, url, display_order: i});
+      }
+      if (gal.length) updates.gallery = gal;
+    }
+  } catch (err) {
+    logger.error("importSubmissionImages: copy failed", {submissionId, salonId, err});
+    throw new HttpsError("internal", "Could not copy images. You can upload them manually.");
+  }
+  if (Object.keys(updates).length) {
+    updates.updated_at = admin.firestore.FieldValue.serverTimestamp();
+    await db.collection("salons").doc(String(salonId)).update(updates);
+  }
+  return {ok: true, ...updates};
+});
 
 // ── Cloud Function ────────────────────────────────────────────────────────────
 
@@ -1861,3 +2030,13 @@ exports.onReportResolved = onDocumentUpdated(
     }
   },
 );
+
+// ── Customer phone-OTP authentication (Fast2SMS DLT + Firebase custom tokens) ──
+// Implemented in ./auth.js. Required here so `firebase deploy --only functions`
+// discovers them in this codebase.
+const authFns = require("./auth");
+
+exports.authRequestOtp = authFns.authRequestOtp;
+exports.authVerifyOtp = authFns.authVerifyOtp;
+exports.authDeleteAccount = authFns.authDeleteAccount;
+exports.authOtpWatchdog = authFns.authOtpWatchdog;

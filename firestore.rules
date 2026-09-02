@@ -58,8 +58,13 @@ service cloud.firestore {
         && request.resource.data.get('isEnabled', true) == true
         && !('salon_access' in request.resource.data);
       allow update: if isSignedIn() && userId == uid()
-        && frozen(['Role', 'isEnabled', 'salon_access']);
-      allow delete: if isSignedIn() && userId == uid();
+        // `phone` and `auth_provider` are set by the OTP backend from the verified
+        // Auth record; neither app writes them (profile setup writes name/gender/dob).
+        && frozen(['Role', 'isEnabled', 'salon_access', 'phone', 'auth_provider']);
+      // Deletion happens server-side (authDeleteAccount, Admin SDK) after a fresh OTP.
+      // Allowing clients to delete would also let them re-create the document with a
+      // different `phone`, which is exactly what the frozen field above prevents.
+      allow delete: if false;
     }
 
     // ── salons (+ subcollections) ──────────────────────────────────────────────
@@ -220,6 +225,35 @@ service cloud.firestore {
         && request.resource.data.created_at == request.time;
       allow read, update, delete: if isAdmin();
     }
+
+    // ── salon onboarding submissions (public "Salon Onboarding" form) ────────────
+    // A salon owner fills the public /onboard form (signed in anonymously) with full
+    // salon details; the admin later reviews it and creates the salon. Create is
+    // allowed for any (anonymous) signed-in user with a fresh "new" doc; only admins
+    // can read/manage.
+    match /salon_submissions/{id} {
+      allow create: if request.auth != null
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() < 200
+        && request.resource.data.status == 'new'
+        && request.resource.data.created_at == request.time;
+      allow read, update, delete: if isAdmin();
+    }
+
+    // ── OTP / auth infrastructure ────────────────────────────────────────────────
+    // Written and read ONLY by Cloud Functions through the Admin SDK (which bypasses
+    // these rules). Clients must never see OTP sessions, rate-limit counters, the
+    // blocklist, the test numbers or the quota configuration.
+    match /otp_sessions/{docId}     { allow read, write: if false; }
+    match /otp_phones/{docId}       { allow read, write: if false; }
+    match /otp_installs/{docId}     { allow read, write: if false; }
+    match /otp_ips/{docId}          { allow read, write: if false; }
+    match /otp_global/{docId}       { allow read, write: if false; }
+    match /otp_audit/{docId}        { allow read, write: if false; }
+    match /otp_test_numbers/{docId} { allow read, write: if false; }
+    match /otp_blocklist/{docId}    { allow read, write: if false; }
+    match /auth_config/{docId}      { allow read, write: if false; }
 
     // ── server-only (holds salon ledger credentials) ─────────────────────────────
     match /ledger_accounts/{docId} {

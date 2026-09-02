@@ -10,6 +10,7 @@ import BookingsSupport from "./tabs/BookingsSupport";
 import SupportReps from "./tabs/SupportReps";
 import Reports from "./tabs/Reports";
 import PartnerRequests from "./tabs/PartnerRequests";
+import SalonSubmissions from "./tabs/SalonSubmissions";
 import { listenAppConfig, updateBookingFee } from "../../lib/adminFirestore";
 
 const ADMIN_TABS = [
@@ -20,6 +21,7 @@ const ADMIN_TABS = [
   { id: "support_reps",    label: "Support Reps" },
   { id: "reports",         label: "Reports" },
   { id: "partner_requests", label: "Partner Requests" },
+  { id: "onboarding",      label: "Onboarding" },
   { id: "header_images",   label: "Header Images" },
   { id: "explore_section", label: "Explore Section" },
   { id: "support",         label: "Support" },
@@ -35,6 +37,7 @@ export default function AdminPanel({ role }) {
   const tabs = isSupport ? SUPPORT_TABS : ADMIN_TABS;
 
   const [tab, setTab] = useState(isSupport ? "bookings" : "salons_list");
+  const [prefillSubmission, setPrefillSubmission] = useState(null);
   const [bookingFee, setBookingFee] = useState(0);
   const [feeInput, setFeeInput] = useState("0");
   const [savingFee, setSavingFee] = useState(false);
@@ -88,7 +91,7 @@ export default function AdminPanel({ role }) {
         {/* Sidebar */}
         <nav className="w-52 border-r border-white/10 p-4 flex flex-col gap-1 shrink-0">
           {tabs.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)}
+            <button key={t.id} onClick={() => { setTab(t.id); if (t.id === "add_salon") setPrefillSubmission(null); }}
               className={`text-left px-3 py-2 rounded text-sm transition-colors ${
                 tab === t.id
                   ? "bg-[#18B79B]/15 text-[#18B79B] font-medium"
@@ -102,12 +105,13 @@ export default function AdminPanel({ role }) {
         {/* Content */}
         <main className="flex-1 p-6 overflow-y-auto">
           {tab === "salons_list"     && !isSupport && <Salons />}
-          {tab === "add_salon"       && !isSupport && <AddSalon />}
+          {tab === "add_salon"       && !isSupport && <AddSalon initialData={prefillSubmission} onCreated={() => setPrefillSubmission(null)} />}
           {tab === "categories"      && !isSupport && <Categories />}
           {tab === "bookings"        && <BookingsSupport />}
           {tab === "support_reps"    && !isSupport && <SupportReps />}
           {tab === "reports"         && !isSupport && <Reports />}
           {tab === "partner_requests" && !isSupport && <PartnerRequests />}
+          {tab === "onboarding"      && !isSupport && <SalonSubmissions onUseInAddSalon={(s) => { setPrefillSubmission(s); setTab("add_salon"); }} />}
           {tab === "header_images"   && !isSupport && <HeaderImages />}
           {tab === "explore_section" && !isSupport && <ExploreSection />}
           {tab === "support"         && !isSupport && <Support />}

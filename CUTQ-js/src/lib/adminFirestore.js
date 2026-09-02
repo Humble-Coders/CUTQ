@@ -654,3 +654,74 @@ export async function updatePartnerRequestStatus(id, status) {
 export async function deletePartnerRequest(id) {
   await deleteDoc(doc(requireDb(), "partner_requests", id));
 }
+
+// ─── Salon onboarding submissions (public /onboard form) ───────────────
+// Writes a full salon-details submission (with images) for the admin to review.
+// `fields` mirrors the Add Salon inputs; images go under salon_submissions/{id}/.
+export async function submitSalonOnboarding(fields, { logoFile, coverFile, galleryFiles = [] }) {
+  const _db = requireDb();
+  const id = makeId();
+  const base = `salon_submissions/${id}`;
+
+  const logoPath = logoFile ? `${base}/logo.jpg` : "";
+  const coverPath = coverFile ? `${base}/cover.jpg` : "";
+  const logo_url = logoFile ? await uploadFile(logoPath, logoFile) : "";
+  const cover_photo = coverFile ? await uploadFile(coverPath, coverFile) : "";
+
+  const gallery = [];
+  for (let i = 0; i < galleryFiles.length; i++) {
+    const path = `${base}/gallery/${makeId()}.jpg`;
+    const url = await uploadFile(path, galleryFiles[i]);
+    gallery.push({ url, path, display_order: i });
+  }
+
+  await setDoc(doc(_db, "salon_submissions", id), {
+    name: fields.name || "",
+    targeted_gender: parseTargetedGender(fields.targeted_gender),
+    phone: fields.phone || "",
+    email: fields.email || "",
+    address: fields.address || "",
+    city: fields.city || "",
+    state: fields.state || "",
+    pincode: fields.pincode || "",
+    max_bookings_per_slot: parseMaxBookingsPerSlot(fields.max_bookings_per_slot),
+    owner_email: fields.owner_email || "",
+    owner_name: fields.owner_name || "",
+    owner_phone: fields.owner_phone || "",
+    location: fields.location
+      ? { lat: Number(fields.location.lat), lng: Number(fields.location.lng) }
+      : null,
+    working_hours: fields.working_hours || {},
+    logo_url, logo_path: logoPath,
+    cover_photo, cover_path: coverPath,
+    gallery,
+    status: "new",
+    created_at: serverTimestamp(),
+  });
+  return id;
+}
+
+export function listenSalonSubmissions(callback) {
+  const _db = requireDb();
+  const q = query(collection(_db, "salon_submissions"), orderBy("created_at", "desc"));
+  return onSnapshot(q, snap => callback(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+}
+
+export async function deleteSalonSubmission(sub) {
+  const _db = requireDb();
+  const paths = [sub.logo_path, sub.cover_path, ...(sub.gallery || []).map(g => g.path)].filter(Boolean);
+  await Promise.all(paths.map(p => deleteFile(p)));
+  await deleteDoc(doc(_db, "salon_submissions", sub.id));
+}
+
+// ─── Callables (Cloud Functions) ───────────────────────────────────────
+export async function deleteSalonCascade(salonId) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  await httpsCallable(functions, "deleteSalonCascade")({ salonId });
+}
+
+export async function importSubmissionImages(payload) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const res = await httpsCallable(functions, "importSubmissionImages")(payload);
+  return res.data;
+}

@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { toast } from "sonner";
-import { Pencil, X, ToggleLeft, ToggleRight, ChevronDown, ChevronUp, BadgeCheck, BadgeX } from "lucide-react";
-import { listenSalons, updateSalon, toggleSalon, uploadSalonGalleryItem } from "../../../lib/adminFirestore";
+import { Pencil, X, ToggleLeft, ToggleRight, ChevronDown, ChevronUp, BadgeCheck, BadgeX, Trash2, Loader2, AlertTriangle } from "lucide-react";
+import { listenSalons, updateSalon, toggleSalon, uploadSalonGalleryItem, deleteSalonCascade } from "../../../lib/adminFirestore";
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
 
@@ -350,6 +350,22 @@ function SalonRow({ salon }) {
   const [editing, setEditing] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState(false);
+  const [deleteStep, setDeleteStep] = useState(0); // 0 closed, 1 first confirm, 2 final confirm
+  const [deleting, setDeleting] = useState(false);
+
+  async function handleDelete() {
+    setDeleting(true);
+    try {
+      await deleteSalonCascade(salon.id);
+      toast.success(`Deleted "${salon.name}"`);
+      setDeleteStep(0);
+    } catch (err) {
+      console.error(err);
+      toast.error(err?.message || "Failed to delete salon");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   async function handleToggle(field) {
     setToggling(true);
@@ -365,6 +381,55 @@ function SalonRow({ salon }) {
   return (
     <>
       {editing && <EditSalonDrawer salon={salon} onClose={() => setEditing(false)} />}
+
+      {/* Delete confirmation (two steps) */}
+      {deleteStep > 0 && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => !deleting && setDeleteStep(0)}>
+          <div className="w-full max-w-md rounded-xl border border-white/10 bg-[#141414] p-6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-2 mb-3">
+              <AlertTriangle size={18} className="text-red-400" />
+              <h3 className="text-base font-semibold text-white">
+                {deleteStep === 1 ? "Delete this salon?" : "Are you absolutely sure?"}
+              </h3>
+            </div>
+            {deleteStep === 1 ? (
+              <p className="text-sm text-gray-300">
+                You are about to delete <span className="font-semibold text-white">{salon.name}</span>. This is a
+                destructive action.
+              </p>
+            ) : (
+              <p className="text-sm text-gray-300">
+                This permanently deletes <span className="font-semibold text-white">{salon.name}</span>, along with its
+                services, stylists, team members, and all its images. Past bookings are kept for records.
+                <span className="block mt-2 text-red-300">This cannot be undone.</span>
+              </p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setDeleteStep(0)}
+                disabled={deleting}
+                className="px-3 py-1.5 text-sm rounded border border-white/10 text-gray-300 hover:bg-white/5 disabled:opacity-50">
+                Cancel
+              </button>
+              {deleteStep === 1 ? (
+                <button
+                  onClick={() => setDeleteStep(2)}
+                  className="px-3 py-1.5 text-sm rounded bg-red-500/90 text-white hover:bg-red-500 font-medium">
+                  Continue
+                </button>
+              ) : (
+                <button
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded bg-red-600 text-white hover:bg-red-700 font-semibold disabled:opacity-60">
+                  {deleting ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                  Delete permanently
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="rounded-lg border border-white/10 bg-white/5 overflow-hidden">
         {/* Main row */}
@@ -398,6 +463,7 @@ function SalonRow({ salon }) {
               }
             </button>
             <button onClick={() => setEditing(true)} className="text-gray-400 hover:text-white"><Pencil size={14} /></button>
+            <button onClick={() => setDeleteStep(1)} title="Delete salon" className="text-gray-400 hover:text-red-400"><Trash2 size={14} /></button>
             <button onClick={() => setExpanded(p => !p)} className="text-gray-400 hover:text-white">
               {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </button>

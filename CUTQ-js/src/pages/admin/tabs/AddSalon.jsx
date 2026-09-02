@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { getIdToken } from "firebase/auth";
-import { addSalonFull } from "../../../lib/adminFirestore";
+import { addSalonFull, importSubmissionImages } from "../../../lib/adminFirestore";
 import { auth } from "../../../firebase";
 
 const DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
@@ -10,20 +10,35 @@ const defaultHours = Object.fromEntries(
   DAYS.map(d => [d, { open: "09:00", close: "20:00", is_closed: d === "sunday" }])
 );
 
-export default function AddSalon() {
+// `initialData` (optional): a salon_submissions doc used to prefill the form.
+// When present, images already uploaded by the salon are shown as current and,
+// if kept, copied into the new salon's storage after creation.
+export default function AddSalon({ initialData = null, onCreated }) {
+  const init = initialData || {};
+  const submissionId = initialData?.id || null;
+  const existingLogoUrl = init.logo_url || "";
+  const existingCoverUrl = init.cover_photo || "";
+  const existingGallery = Array.isArray(init.gallery) ? init.gallery : [];
+
   const [form, setForm] = useState({
-    name: "", owner_uid: "", address: "", city: "", state: "",
-    pincode: "", phone: "", email: "",
-    targeted_gender: "unisex",
-    max_bookings_per_slot: "1",
+    name: init.name || "", owner_uid: "",
+    address: init.address || "", city: init.city || "", state: init.state || "",
+    pincode: init.pincode || "", phone: init.phone || "", email: init.email || "",
+    targeted_gender: init.targeted_gender || "unisex",
+    max_bookings_per_slot: init.max_bookings_per_slot != null ? String(init.max_bookings_per_slot) : "1",
   });
-  const [ownerEmail, setOwnerEmail] = useState("");
-  const [ownerName, setOwnerName] = useState("");
-  const [ownerPhone, setOwnerPhone] = useState("");
+  const [ownerEmail, setOwnerEmail] = useState(init.owner_email || "");
+  const [ownerName, setOwnerName] = useState(init.owner_name || "");
+  const [ownerPhone, setOwnerPhone] = useState(init.owner_phone || "");
   const [creatingOwner, setCreatingOwner] = useState(false);
-  const [location, setLocation] = useState({ lat: "", lng: "" });
+  const [location, setLocation] = useState({
+    lat: init.location?.lat != null ? String(init.location.lat) : "",
+    lng: init.location?.lng != null ? String(init.location.lng) : "",
+  });
   const [locating, setLocating] = useState(false);
-  const [hours, setHours] = useState(defaultHours);
+  const [hours, setHours] = useState(
+    init.working_hours && Object.keys(init.working_hours).length ? init.working_hours : defaultHours
+  );
   const [logoFile, setLogoFile] = useState(null);
   const [coverFile, setCoverFile] = useState(null);
   const [galleryFiles, setGalleryFiles] = useState([]);
@@ -61,6 +76,19 @@ export default function AddSalon() {
     );
   }
 
+  function resetForm() {
+    setForm({
+      name: "", owner_uid: "", address: "", city: "", state: "",
+      pincode: "", phone: "", email: "",
+      targeted_gender: "unisex",
+      max_bookings_per_slot: "1",
+    });
+    setOwnerEmail(""); setOwnerName(""); setOwnerPhone("");
+    setLocation({ lat: "", lng: "" });
+    setHours(defaultHours);
+    setLogoFile(null); setCoverFile(null); setGalleryFiles([]);
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     const required = ["name","address","city","state","pincode","phone","email"];
@@ -95,8 +123,6 @@ export default function AddSalon() {
           body: JSON.stringify({ data: { email: ownerEmail.trim(), name: ownerName.trim(), phone: ownerPhone.trim() } }),
         }
       );
-      // The function may return a non-JSON body on an unexpected crash - read text
-      // first so we can surface a useful message instead of a JSON parse error.
       const raw = await fnRes.text();
       let fnJson = {};
       try {
@@ -110,7 +136,8 @@ export default function AddSalon() {
       if (!ownerUid) throw new Error("Owner account was not created (no UID returned).");
       setCreatingOwner(false);
 
-      // all file uploads (logo + cover + gallery) happen in parallel - single updateDoc
+      // Uploads only the NEW files the admin selected. Kept submission images
+      // (no new file) are copied server-side afterwards.
       const id = await addSalonFull(
         { ...form, owner_uid: ownerUid, location: { lat, lng }, working_hours: hours },
         logoFile,
@@ -118,30 +145,33 @@ export default function AddSalon() {
         galleryFiles,
       );
 
+      // Copy any kept submission images into the salon's own storage.
+      if (submissionId) {
+        const fields = {
+          logo: !logoFile && !!existingLogoUrl,
+          cover: !coverFile && !!existingCoverUrl,
+          gallery: galleryFiles.length === 0 && existingGallery.length > 0,
+        };
+        if (fields.logo || fields.cover || fields.gallery) {
+          try {
+            await importSubmissionImages({ submissionId, salonId: id, fields });
+          } catch (imgErr) {
+            console.error(imgErr);
+            toast.error("Salon created, but copying some images failed. You can upload them via Edit.");
+          }
+        }
+      }
+
       const ownerNote = fnJson.result?.isExistingOwner
         ? " (linked to existing owner account)"
         : fnJson.result?.emailSent === false
           ? " (owner created - welcome email could not be sent)"
           : "";
       toast.success(`Salon added!${ownerNote} ID: ${id}`);
-      setForm({
-        name: "", owner_uid: "", address: "", city: "", state: "",
-        pincode: "", phone: "", email: "",
-        targeted_gender: "unisex",
-        max_bookings_per_slot: "1",
-      });
-      setOwnerEmail("");
-      setOwnerName("");
-      setOwnerPhone("");
-      setLocation({ lat: "", lng: "" });
-      setHours(defaultHours);
-      setLogoFile(null);
-      setCoverFile(null);
-      setGalleryFiles([]);
+      resetForm();
+      onCreated?.();
     } catch (err) {
       console.error(err);
-      // Surface the real reason so the admin knows what to fix, instead of a
-      // generic "Failed to add salon".
       const msg =
         err?.message ||
         err?.code ||
@@ -156,6 +186,12 @@ export default function AddSalon() {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-6 max-w-2xl">
+      {submissionId && (
+        <div className="rounded-lg border border-[#18B79B]/30 bg-[#18B79B]/10 px-4 py-2.5 text-sm text-[#18B79B]">
+          Prefilled from a salon onboarding submission. Review everything, then click Create Salon.
+        </div>
+      )}
+
       {/* Basic Info */}
       <section className="flex flex-col gap-4">
         <h2 className="text-base font-semibold text-white border-b border-white/10 pb-2">Basic Information</h2>
@@ -272,12 +308,19 @@ export default function AddSalon() {
         <h2 className="text-base font-semibold text-white border-b border-white/10 pb-2">Images</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {[
-            { label: "Logo", file: logoFile, setFile: setLogoFile },
-            { label: "Cover Photo", file: coverFile, setFile: setCoverFile },
-          ].map(({ label, file, setFile }) => (
+            { label: "Logo", file: logoFile, setFile: setLogoFile, existing: existingLogoUrl },
+            { label: "Cover Photo", file: coverFile, setFile: setCoverFile, existing: existingCoverUrl },
+          ].map(({ label, file, setFile, existing }) => (
             <div key={label} className="flex flex-col gap-2">
               <label className="text-xs text-gray-400">{label}</label>
-              {file && <img src={URL.createObjectURL(file)} className="w-full h-32 object-cover rounded border border-white/10" />}
+              {file ? (
+                <img alt="" src={URL.createObjectURL(file)} className="w-full h-32 object-cover rounded border border-white/10" />
+              ) : existing ? (
+                <div className="relative">
+                  <img alt="" src={existing} className="w-full h-32 object-cover rounded border border-white/10" />
+                  <span className="absolute top-1 left-1 text-[10px] bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-gray-200">from submission</span>
+                </div>
+              ) : null}
               <input type="file" accept="image/*" onChange={e => setFile(e.target.files[0])}
                 className="text-xs text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-[#18B79B] file:text-white file:cursor-pointer" />
             </div>
@@ -292,17 +335,29 @@ export default function AddSalon() {
             onChange={e => setGalleryFiles(Array.from(e.target.files || []))}
             className="text-xs text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-[#18B79B] file:text-white file:cursor-pointer"
           />
-          {galleryFiles.length > 0 && (
+          {galleryFiles.length > 0 ? (
             <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
               {galleryFiles.map((f, idx) => (
                 <div key={`${f.name}_${idx}`} className="relative">
-                  <img src={URL.createObjectURL(f)} className="w-full h-20 object-cover rounded border border-white/10" />
+                  <img alt="" src={URL.createObjectURL(f)} className="w-full h-20 object-cover rounded border border-white/10" />
                   <div className="absolute top-1 left-1 text-[10px] bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-gray-200">
                     order {idx}
                   </div>
                 </div>
               ))}
             </div>
+          ) : existingGallery.length > 0 ? (
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+              {existingGallery.map((g, idx) => (
+                <div key={g.path || idx} className="relative">
+                  <img alt="" src={g.url} className="w-full h-20 object-cover rounded border border-white/10" />
+                  <span className="absolute top-1 left-1 text-[10px] bg-black/60 border border-white/10 rounded px-1.5 py-0.5 text-gray-200">from submission</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {existingGallery.length > 0 && (
+            <p className="text-[11px] text-gray-500">Selecting new gallery images replaces the submitted ones.</p>
           )}
         </div>
       </section>

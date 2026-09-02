@@ -686,3 +686,46 @@ panel only. Suggested admin surface: a "Partner requests" / leads inbox.
 
 **Security rule:** create is public with a strict field whitelist + validation;
 `read`, `update`, `delete` are `isAdmin()` only.
+
+---
+
+## `salon_submissions`
+
+**Document ID:** auto-generated
+
+Full salon details captured by the public **Salon Onboarding** form at
+`admin.cutqsalons.in/onboard` (submitter is signed in anonymously). The admin reviews a
+submission and pushes it into **Add Salon** (prefilled, editable) to create the salon; nothing
+is created automatically. Images upload to `salon_submissions/{id}/...` and are copied into
+`salons/{salonId}/...` when the salon is created.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | string | Salon name (required) |
+| `targeted_gender` | string | `"male"` \| `"female"` \| `"unisex"` |
+| `phone` | string | Salon contact |
+| `email` | string | Salon email |
+| `address` | string | |
+| `city` | string | |
+| `state` | string | |
+| `pincode` | string | |
+| `max_bookings_per_slot` | number | |
+| `owner_email` | string | Prospective owner email |
+| `owner_name` | string | |
+| `owner_phone` | string | |
+| `location` | map \| null | `{ lat, lng }` from device geolocation |
+| `working_hours` | map | Same shape as `salons.working_hours` |
+| `logo_url` / `logo_path` | string | Uploaded logo URL + Storage path |
+| `cover_photo` / `cover_path` | string | Uploaded cover URL + Storage path |
+| `gallery` | array | `[{ url, path, display_order }]` |
+| `status` | string | `"new"` on create |
+| `created_at` | timestamp | Must equal `request.time` |
+
+**Storage:** `salon_submissions/{id}/logo.jpg`, `/cover.jpg`, `/gallery/{uuid}.jpg`
+
+**Security rule:** `create` requires a signed-in (anonymous ok) user with `name`, `status == "new"`,
+`created_at == request.time`; `read`, `update`, `delete` are `isAdmin()` only.
+
+**Related Cloud Functions:** `importSubmissionImages` (copies submission images into a salon on
+create); `deleteSalonCascade` (admin salon delete: removes the salon doc + subcollections +
+images, keeps bookings).

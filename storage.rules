@@ -66,6 +66,13 @@ service firebase.storage {
       allow write: if validImage() && isSignedIn() && userId == uid();
     }
 
+    // Salon onboarding submissions — public /onboard form uploads (signed in
+    // anonymously). Readable by all; the admin copies these into salons/ on create.
+    match /salon_submissions/{id}/{allPaths=**} {
+      allow read: if true;
+      allow write: if validImage() && isSignedIn();
+    }
+
     match /{allPaths=**} {
       allow read, write: if false;
     }

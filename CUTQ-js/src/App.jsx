@@ -1,8 +1,18 @@
 import { Toaster } from "sonner";
 import { firebaseConfigured } from "./firebase.js";
 import AdminAuth from "./pages/admin/AdminAuth.jsx";
+import SalonOnboarding from "./pages/SalonOnboarding.jsx";
 
 function App() {
+  // Public, no-login route for salons to submit their details: /onboard
+  if (firebaseConfigured && typeof window !== "undefined" && window.location.pathname.startsWith("/onboard")) {
+    return (
+      <>
+        <SalonOnboarding />
+        <Toaster position="top-right" />
+      </>
+    );
+  }
   if (!firebaseConfigured) {
     return (
       <>

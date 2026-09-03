@@ -1627,6 +1627,9 @@ exports.ledgerRecordSale = onCall(async (request) => {
 
 exports.ledgerReverseSale = onCall(async (request) => {
   const {bookingId, reason} = request.data || {};
+  // Guard before use: doc(undefined) throws inside the SDK and surfaces as an
+  // opaque INTERNAL rather than telling the caller what was missing.
+  if (!bookingId) throw new HttpsError("invalid-argument", "bookingId is required.");
   const bref = admin.firestore().collection("bookings").doc(bookingId);
   const bsnap = await bref.get();
   if (!bsnap.exists) throw new HttpsError("not-found", "Booking not found.");

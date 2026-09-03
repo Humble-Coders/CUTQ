@@ -136,7 +136,7 @@ export default function ExploreSection() {
   }
 
   function categoryName(catId) {
-    return categories.find(c => c.id === catId)?.name ?? catId;
+    return categories.find(c => c.id === catId)?.name ?? null;
   }
 
   async function handleAdd(data, imageFile) {
@@ -247,9 +247,17 @@ export default function ExploreSection() {
                 {/* Info */}
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-white truncate">{item.title}</p>
-                  <p className="text-xs text-gray-500 mt-0.5">
-                    Category: <span className="text-gray-400">{categoryName(item.category_id)}</span>
-                  </p>
+                  {/* A tile whose category was deleted does nothing in the app, so say so
+                      loudly rather than printing a raw id that reads like a name. */}
+                  {categoryName(item.category_id) ? (
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Opens: <span className="text-gray-400">{categoryName(item.category_id)}</span>
+                    </p>
+                  ) : (
+                    <p className="text-xs text-red-400 mt-0.5">
+                      ⚠ Category no longer exists — this tile is not tappable in the app. Edit it to pick a category.
+                    </p>
+                  )}
                 </div>
 
                 {/* Actions */}

@@ -530,6 +530,10 @@ async function recordSaleForBooking(bookingId, {actorUid} = {}) {
   if (!bsnap.exists) throw new Error("Booking not found");
   const booking = bsnap.data();
   if (booking.status !== "completed") throw new Error("Booking is not completed");
+  // Every downstream step keys off the salon — ledger company, invoice sequence,
+  // bill tenant. Without it the Firestore SDK throws on doc(undefined) and the
+  // salon sees an opaque resource-path error instead of the real problem.
+  if (!booking.salon_id) throw new Error("Booking has no salon_id");
 
   const {cred} = await ensureSalonLedger(booking.salon_id);
   const totals = computeTotals(booking);

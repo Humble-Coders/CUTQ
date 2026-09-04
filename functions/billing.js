@@ -29,9 +29,17 @@ function fmtBillDate(ms) {
 }
 
 // Build the invoice `data` payload from a booking + salon + resolved customer.
-// Amounts are kept identical to the accounting sale: line items are the
-// services plus the CutQ booking fee; total = final_amount.
-function buildInvoiceData({booking, invoiceNo, salon, customerName}) {
+//
+// `total` is the amount the ledger actually posted (ledger.computeTotals), passed
+// in rather than recomputed here. The bill and the accounting sale must never
+// disagree, and deriving the same figure twice from the same booking is a
+// divergence waiting for the two formulas to drift apart. The discount row is
+// then derived as subtotal - total so the printed arithmetic always adds up,
+// whatever discount_amount happens to say.
+function buildInvoiceData({booking, invoiceNo, salon, customerName, total}) {
+  if (!Number.isFinite(Number(total))) {
+    throw new Error("buildInvoiceData: total is required (the posted sale amount).");
+  }
   const services = Array.isArray(booking.services) ? booking.services : [];
   const lineItems = services.map((s) => ({
     name: s.service_name || "Service",
@@ -42,8 +50,9 @@ function buildInvoiceData({booking, invoiceNo, salon, customerName}) {
   if (fee > 0) lineItems.push({name: "Booking Fee", qty: 1, rate: fee});
 
   const subtotal = lineItems.reduce((a, l) => a + l.qty * l.rate, 0);
-  const discount = Number(booking.discount_amount) || 0;
-  const total = Number(booking.final_amount) || Math.max(0, subtotal - discount);
+  const billTotal = Number(total);
+  // Never negative, and never more than the lines add up to.
+  const discount = Math.max(0, Math.min(subtotal, subtotal - billTotal));
   const when = booking.completion?.completed_at?.toMillis?.() ||
     booking.slot_start?.toMillis?.() || Date.now();
   // Compose the address from parts, skipping any part already present in what
@@ -65,8 +74,8 @@ function buildInvoiceData({booking, invoiceNo, salon, customerName}) {
     customerName: customerName || "Customer",
     lineItems: lineItems.length ? lineItems : undefined,
     subtotal,
-    total,
-    amountPaid: total, // paid in full at completion
+    total: billTotal,
+    amountPaid: billTotal, // paid in full at completion
     currency: "INR",
   };
   // Optional rows - only include when meaningful (0/empty ⇒ omit so the row hides).

@@ -3,11 +3,21 @@
  * booking and returns a public URL.
  *
  * Contract (see http://68.183.86.89/cutq-docs/):
- *   POST { appId: "cutq", data: {...} } -> { message, url }
- *   Idempotent per data.invoiceNo (filename invoices/cutq-<invoiceNo>.pdf), so
- *   the invoiceNo MUST be globally unique across all CutQ salons. We use the
- *   same CUTQ-<year>-<seq> number that is stored on the accounting invoice.
+ *   POST { appId: "cutq", tenantId, data: {...} } -> { message, url }
  *   Optional fields are OMITTED (never sent as 0) so their rows are hidden.
+ *
+ * The engine writes into ONE S3 bucket shared by every Humble Solutions app. The
+ * object key used to be (appId, invoiceNo) alone, which meant any two renders
+ * agreeing on that pair silently overwrote each other — across customers of the
+ * same app, and with no error, because PutObject on an existing key succeeds.
+ * That is what happened to Aromex in Aug 2026: one client's invoice PDF was
+ * replaced in place by another client's, and the stale URL kept resolving.
+ *
+ * Passing `tenantId` moves the object to `invoices/cutq/<tenantId>/<no>-<nonce>`.
+ * We send the salon id: structurally unique per salon, not a display name and not
+ * something a new salon could be provisioned with unchanged. The per-render nonce
+ * also means re-issuing a bill never overwrites a PDF a customer already holds a
+ * link to — it writes a new object and we store the new URL.
  */
 
 const BILLING_URL = "https://ty7dvtg7bygzryorzmszp6ykjy0qlhsv.lambda-url.us-east-1.on.aws/";
@@ -66,11 +76,12 @@ function buildInvoiceData({booking, invoiceNo, salon, customerName}) {
   return data;
 }
 
-async function generateInvoicePdf(data) {
+async function generateInvoicePdf(data, tenantId) {
+  if (!tenantId) throw new Error("generateInvoicePdf: tenantId (salon id) is required.");
   const res = await fetch(BILLING_URL, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({appId: "cutq", data}),
+    body: JSON.stringify({appId: "cutq", tenantId: String(tenantId), data}),
   });
   const text = await res.text();
   let json;

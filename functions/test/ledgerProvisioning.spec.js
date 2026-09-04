@@ -255,6 +255,66 @@ describe("ensureSalonLedger", () => {
   });
 });
 
+describe("ensureInvoiceNumber — per-salon numbering", () => {
+  after(() => {
+    setFirestore(realFirestore);
+  });
+
+  const numberFor = async (salonId, bookingId) => {
+    db._set("bookings", bookingId, {salon_id: salonId, status: "completed"});
+    return ledger.ensureInvoiceNumber(bookingId, salonId);
+  };
+
+  it("gives each salon its own sequence starting at 1", async () => {
+    reset();
+    assert.strictEqual(await numberFor("ROfUwg5wHGOcDWnCUUKS", "b1"), "CUTQ-ROFUWG-2026-0001");
+    assert.strictEqual(await numberFor("ROfUwg5wHGOcDWnCUUKS", "b2"), "CUTQ-ROFUWG-2026-0002");
+    assert.strictEqual(await numberFor("oITixzOE0LBEHLj8fgIu", "b3"), "CUTQ-OITIXZ-2026-0001");
+    assert.strictEqual(await numberFor("oITixzOE0LBEHLj8fgIu", "b4"), "CUTQ-OITIXZ-2026-0002");
+  });
+
+  it("is stable per booking — a retry reuses the allocated number", async () => {
+    reset();
+    const first = await numberFor("salonA1", "b1");
+    const again = await ledger.ensureInvoiceNumber("b1", "salonA1");
+    assert.strictEqual(again, first);
+    // Sequence must not advance on the replay.
+    assert.strictEqual(db._get("salon_billing", "salonA1").seq, 1);
+  });
+
+  it("never issues the same code to two salons, even on a shared prefix", async () => {
+    // The regression that matters: a 6-char prefix of the salon id is only
+    // PROBABLY unique. Two salons sharing one would collide their invoice numbers.
+    reset();
+    const a = await numberFor("ABCDEFzzzz1111111111", "b1");
+    const b = await numberFor("ABCDEFyyyy2222222222", "b2");
+    assert.strictEqual(a, "CUTQ-ABCDEF-2026-0001");
+    assert.strictEqual(b, "CUTQ-ABCDEF2-2026-0001", "second salon must be disambiguated");
+    assert.notStrictEqual(a, b);
+    assert.strictEqual(db._get("invoice_codes", "ABCDEF").salonId, "ABCDEFzzzz1111111111");
+    assert.strictEqual(db._get("invoice_codes", "ABCDEF2").salonId, "ABCDEFyyyy2222222222");
+  });
+
+  it("reuses a salon's claimed code rather than claiming another", async () => {
+    reset();
+    await numberFor("salonA1", "b1");
+    await numberFor("salonA1", "b2");
+    const claimed = Object.keys(Object.fromEntries(db._data)).filter((k) => k.startsWith("invoice_codes/"));
+    assert.strictEqual(claimed.length, 1, `expected one claimed code, got ${claimed}`);
+  });
+
+  it("falls back to a usable code when the salon id has no alphanumerics", async () => {
+    reset();
+    assert.strictEqual(await numberFor("---", "b1"), "CUTQ-SALON-2026-0001");
+  });
+
+  it("derives the year in IST, not UTC", () => {
+    reset();
+    // 00:30 IST on 1 Jan is still 31 Dec in UTC.
+    assert.strictEqual(ledger.istDate(new Date("2027-01-01T00:30:00+05:30")).slice(0, 4), "2027");
+  });
+});
+
 describe("istDate", () => {
   it("reports the IST calendar date, not the UTC one", () => {
     reset();

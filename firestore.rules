@@ -270,6 +270,18 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Invoice numbering, server-only. `salon_billing` holds each salon's invoice
+    // code and its own running sequence; `invoice_codes` is the claim registry
+    // that makes a code unique across salons. A client able to write either could
+    // hand two salons the same code and collide their invoice numbers, so both are
+    // denied outright rather than left to the catch-all.
+    match /salon_billing/{docId} {
+      allow read, write: if false;
+    }
+    match /invoice_codes/{docId} {
+      allow read, write: if false;
+    }
+
     // ── default deny ─────────────────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;

@@ -411,22 +411,65 @@ async function ensureSalonLedger(salonId) {
   return {cred: record};
 }
 
-// Allocate a globally-unique, human-readable invoice number (CUTQ-<year>-<seq>)
-// once per booking, from a global Firestore counter. Reused on retries. This
-// same number is stored on the accounting invoice AND printed on the bill, and
-// is unique across all salons (required by the flat bill filename namespace).
-async function ensureInvoiceNumber(bookingId) {
+// Allocate a human-readable invoice number, once per booking, and reuse it on
+// every retry. The same number goes on the accounting invoice and is printed on
+// the bill.
+//
+//   CUTQ-<salon code>-<IST year>-<per-salon sequence>      e.g. CUTQ-ROFUWG-2026-0001
+//
+// Each salon counts its own invoices from 1, which is what a salon expects on its
+// own books. Two salons therefore reach sequence 0001 on the same day, so the
+// SALON CODE is the part that makes the number globally unique — and it is
+// unique by construction, not by luck: a code is claimed transactionally in
+// `invoice_codes/{CODE}` and can never be handed to a second salon. Deriving it
+// from a prefix of the salon id alone would only be *probably* unique, which is
+// the kind of assumption that turns into a cross-tenant overwrite the day it
+// fails (see the Humble Bill Engine tenant-collision incident, Aug 2026).
+//
+// The bill engine is additionally given `tenantId: salonId`, so even if two
+// salons somehow shared a number their PDFs land under different S3 prefixes.
+const CODE_VARIANTS = 5;
+
+function codeBase(salonId) {
+  return String(salonId).replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 6) || "SALON";
+}
+
+async function ensureInvoiceNumber(bookingId, salonId) {
   const db = admin.firestore();
   const bref = db.collection("bookings").doc(bookingId);
-  const counterRef = db.collection("app_config").doc("invoice_counter");
+  const billingRef = db.collection("salon_billing").doc(salonId);
+  const base = codeBase(salonId);
+  // Readable first choice, then disambiguated: ROFUWG, ROFUWG2, ROFUWG3…
+  const candidates = Array.from({length: CODE_VARIANTS}, (_, i) => (i === 0 ? base : `${base}${i + 1}`));
+
   return db.runTransaction(async (tx) => {
+    // Every read first — Firestore forbids a read after a write in a transaction.
     const b = await tx.get(bref);
     const existing = b.data()?.ledger?.invoiceNumber;
     if (existing) return existing;
-    const c = await tx.get(counterRef);
-    const n = (c.data()?.seq || 0) + 1;
-    tx.set(counterRef, {seq: n, updated_at: admin.firestore.FieldValue.serverTimestamp()}, {merge: true});
-    const num = `CUTQ-${new Date().getFullYear()}-${String(n).padStart(4, "0")}`;
+
+    const billing = await tx.get(billingRef);
+    let code = billing.data()?.code || null;
+    let claim = null;
+    if (!code) {
+      const taken = await Promise.all(candidates.map((c) => tx.get(db.collection("invoice_codes").doc(c))));
+      const freeAt = taken.findIndex((t) => !t.exists);
+      if (freeAt === -1) throw new Error(`Could not allocate an invoice code for salon ${salonId}`);
+      code = candidates[freeAt];
+      claim = db.collection("invoice_codes").doc(code);
+    }
+
+    const seq = (billing.data()?.seq || 0) + 1;
+    // IST year, so a booking completed just after midnight IST is not filed under
+    // the previous year (the same reason postings use istDate()).
+    const num = `CUTQ-${code}-${istDate().slice(0, 4)}-${String(seq).padStart(4, "0")}`;
+
+    if (claim) {
+      tx.set(claim, {salonId, created_at: admin.firestore.FieldValue.serverTimestamp()});
+    }
+    tx.set(billingRef, {
+      code, seq, updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
     tx.set(bref, {ledger: {invoiceNumber: num}}, {merge: true});
     return num;
   });
@@ -467,7 +510,11 @@ async function makeBill({booking, bookingId, invoiceNo, customerName}) {
     const salonSnap = await admin.firestore().collection("salons").doc(booking.salon_id).get();
     const salon = salonSnap.exists ? salonSnap.data() : {};
     const invoiceData = billing.buildInvoiceData({booking, invoiceNo, salon, customerName});
-    return {billUrl: await billing.generateInvoicePdf(invoiceData), billError: null};
+    // tenantId namespaces the PDF in the shared bill-engine bucket. Without it
+    // the object key is (appId, invoiceNumber) only, which is shared across every
+    // CutQ salon and every other app on the engine.
+    const url = await billing.generateInvoicePdf(invoiceData, booking.salon_id);
+    return {billUrl: url, billError: null};
   } catch (err) {
     const billError = String(err.message || err);
     logger.error("bill generation failed", {bookingId, msg: billError});
@@ -489,7 +536,7 @@ async function recordSaleForBooking(bookingId, {actorUid} = {}) {
   const date = todayISO(booking);
 
   // Canonical invoice number, shared by the accounting invoice and the bill.
-  const invoiceNumber = await ensureInvoiceNumber(bookingId);
+  const invoiceNumber = await ensureInvoiceNumber(bookingId, booking.salon_id);
 
   // A fully-comped booking (discount cancels the whole total) has nothing to
   // post — the API rejects amounts below 0.01, so a sale here would fail on
@@ -632,7 +679,9 @@ module.exports = {
   provisionSalon,
   ensureSalonLedger,
   getToken,
+  codeBase,
   computeTotals,
+  ensureInvoiceNumber,
   istDate,
   recordSaleForBooking,
   reverseSaleForBooking,

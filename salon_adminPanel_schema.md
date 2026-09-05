@@ -264,6 +264,7 @@ Each booking represents a single visit and may contain one or more services book
 | `is_reviewed` | boolean | Set to `true` after any review is submitted for this booking |
 | `support_called_salon` | boolean | Set `true` by a Customer Support Rep (admin panel) after phoning the **salon** to confirm the booking. Absent/`false` until then |
 | `support_called_customer` | boolean | Set `true` by a Customer Support Rep after phoning the **customer** to confirm. Absent/`false` until then |
+| `support_actions` | array | Append-only audit of actions an **ADMIN**/**SUPPORT** rep took on this booking from the admin panel (confirm, cancel, reschedule) on a salon's or customer's behalf. Absent until the first such action. See **Support action entry** below |
 | `created_at` | timestamp | |
 | `updated_at` | timestamp | |
 
@@ -281,6 +282,28 @@ Each booking represents a single visit and may contain one or more services book
 > **Backward compatibility:** Old booking documents written before multi-service support have
 > `service_id` and `service_price` at top level instead of a `services` array. Both formats
 > are supported by the app; new bookings always use the `services` array.
+
+### Support action entry
+
+Each item in `support_actions[]`. Written **only** by the Cloud Functions
+`supportUpdateBookingStatus` / `supportRescheduleBooking`.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `action` | string | `"confirm"` \| `"cancel_by_salon"` \| `"cancel_by_user"` \| `"reschedule"` |
+| `acted_as` | string | `"salon"` \| `"user"` — whose behalf the rep acted on. This is what determines `cancelled_by`, and therefore who gets notified |
+| `actor_uid` | string | The rep's own UID — the person who actually performed it |
+| `actor_role` | string | `"ADMIN"` \| `"SUPPORT"` |
+| `actor_name` | string | Snapshot of the rep's name/email for display |
+| `reason` | string \| null | Cancellation reason, when the action was a cancel |
+| `override` | boolean | `true` when an ADMIN pushed the action past a failed validation |
+| `override_code` | string \| null | What was overridden, e.g. `"SLOT_FULL"`, `"STATUS_CANCELLED"` |
+| `at` | timestamp | `Timestamp.now()` — a `serverTimestamp()` sentinel is not permitted inside an array element |
+
+> `cancelled_by` stays `"user"` / `"salon"` / `"system"` even when a rep performed
+> the action. The notification trigger `onBookingStatusChanged` branches on exactly
+> those values and returns silently for anything else, so an `"admin"` value would
+> cancel bookings that notify nobody. The real actor is recorded here instead.
 
 **Indexes:**
 - `(salon_id, slot_start ASC)` — salon dashboard calendar

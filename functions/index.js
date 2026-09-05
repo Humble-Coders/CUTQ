@@ -3,10 +3,17 @@ const {onRequest, onCall, HttpsError} = require("firebase-functions/v2/https");
 const {onDocumentCreated, onDocumentUpdated, onDocumentWritten} = require("firebase-functions/v2/firestore");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
+// Literally the same objects the `admin.firestore.*` namespace exposes, taken
+// from the modular entrypoint instead. The functions emulator proxies the
+// `admin` module and its proxy drops those namespace statics, so the namespaced
+// form reads as `undefined` under `emulators:exec` — which made every write path
+// in this file untestable. Deployed, the two forms are identical.
+const {FieldValue, Timestamp} = require("firebase-admin/firestore");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const sharp = require("sharp");
 const ledger = require("./ledger");
+const slots = require("./bookingSlots");
 
 const {SMTP_USER, SMTP_PASS, PEXELS_API_KEY} = require("./secrets");
 
@@ -348,7 +355,7 @@ exports.importSubmissionImages = onCall(async (request) => {
     throw new HttpsError("internal", "Could not copy images. You can upload them manually.");
   }
   if (Object.keys(updates).length) {
-    updates.updated_at = admin.firestore.FieldValue.serverTimestamp();
+    updates.updated_at = FieldValue.serverTimestamp();
     await db.collection("salons").doc(String(salonId)).update(updates);
   }
   return {ok: true, ...updates};
@@ -449,7 +456,7 @@ exports.createSalonOwner = onRequest(
       if (phone) profileData.phone = phone;
       if (!isExistingOwner) {
         profileData.profile_photo = "";
-        profileData.created_at = admin.firestore.FieldValue.serverTimestamp();
+        profileData.created_at = FieldValue.serverTimestamp();
       }
       await admin.firestore().collection("Users").doc(uid).set(profileData, {merge: true});
 
@@ -593,27 +600,84 @@ exports.onBookingCreatedNotifySalonOwner = onDocumentCreated(
 // On failure: sets status = "cancelled" with a reason.
 // On success: does nothing — booking stays "pending" for salon owner to manage.
 
-function parseTimeToMinutes(timeStr) {
-  const parts = (timeStr || "0:0").split(":");
-  return parseInt(parts[0] || "0") * 60 + parseInt(parts[1] || "0");
+// The five slot checks themselves live in ./bookingSlots as one pure function —
+// see the header there for why. What stays here is the I/O around them.
+
+/**
+ * The day's bookings and blocks for a salon, normalised to plain millis so the
+ * pure checker never sees a Firestore Timestamp.
+ *
+ * The [fromMs, toMs) window is the caller's, deliberately: the write paths pass
+ * the same window they have always used, and the availability grid passes that
+ * identical window so what it shows and what a write accepts come from one set
+ * of rows.
+ */
+async function loadDayContext(db, salonId, fromMs, toMs) {
+  const from = Timestamp.fromMillis(fromMs);
+  const to = Timestamp.fromMillis(toMs);
+
+  const [bookingsSnap, blockedSnap] = await Promise.all([
+    db.collection("bookings")
+      .where("salon_id", "==", salonId)
+      .where("slot_start", ">=", from)
+      .where("slot_start", "<", to)
+      .get(),
+    db.collection("salons").doc(salonId)
+      .collection("blocked_slots")
+      .where("start", ">=", from)
+      .where("start", "<", to)
+      .get(),
+  ]);
+
+  return {
+    bookings: bookingsSnap.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        status: d.status,
+        startMs: d.slot_start?.toDate?.()?.getTime?.() ?? null,
+        endMs: d.slot_end?.toDate?.()?.getTime?.() ?? null,
+      };
+    }),
+    blocked: blockedSnap.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        startMs: d.start?.toDate?.()?.getTime?.() ?? null,
+        endMs: d.end?.toDate?.()?.getTime?.() ?? null,
+      };
+    }),
+  };
 }
 
-// Extract { weekday, totalMinutes } in the given IANA timezone.
-// weekday is lowercase ("monday", "tuesday", …).
-// totalMinutes is hours*60 + minutes in local time.
-function getLocalTimeParts(date, timezone) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    weekday: "long",
-    hour: "numeric",
-    minute: "numeric",
-    hour12: false,
-  }).formatToParts(date);
-  const get = (type) => parts.find((p) => p.type === type)?.value ?? "0";
-  const hour = parseInt(get("hour")); // 0–23
-  const minute = parseInt(get("minute"));
-  const weekday = get("weekday").toLowerCase();
-  return {weekday, totalMinutes: hour * 60 + minute};
+/**
+ * The UTC-day window the capacity and blocked-slot queries have always used.
+ *
+ * NOTE: setHours() is local time, and Cloud Functions run in UTC — so for an
+ * IST salon this window is offset 5h30m from the salon's own day. Preserved
+ * verbatim from the original inline queries; changing it changes which bookings
+ * the live customer path considers, which is its own change.
+ */
+function utcDayWindow(slotStartMs) {
+  const dayStart = new Date(slotStartMs);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setDate(dayEnd.getDate() + 1);
+  return {fromMs: dayStart.getTime(), toMs: dayEnd.getTime()};
+}
+
+/** Load the day, then run the five checks. Used by every write path. */
+async function validateSlotForSalon(db, {salon, salonId, slotStartMs, slotEndMs, excludeBookingId}) {
+  const {fromMs, toMs} = utcDayWindow(slotStartMs);
+  const dayContext = await loadDayContext(db, salonId, fromMs, toMs);
+  return slots.checkSlot({
+    salon,
+    dayContext,
+    slotStartMs,
+    slotEndMs,
+    excludeBookingId,
+    minLeadMs: await serverMinLeadMs(),
+    nowMs: Date.now(),
+  });
 }
 
 exports.validateBookingOnCreate = onDocumentCreated(
@@ -633,7 +697,7 @@ exports.validateBookingOnCreate = onDocumentCreated(
         status: "cancelled",
         cancellation_reason: reason,
         cancelled_by: "system",
-        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
       });
     };
 
@@ -684,74 +748,16 @@ exports.validateBookingOnCreate = onDocumentCreated(
         }
       }
 
-      // 4. Slot must be far enough in the future (admin-configurable, minus the grace).
-      const now = new Date();
-      const minLeadMs = await serverMinLeadMs();
-      const minTime = new Date(now.getTime() + minLeadMs);
-      if (slotStart < minTime) {
-        return cancelBooking(
-          `SLOT_TOO_SOON: Slot must be at least ${Math.round(minLeadMs / 60000)} minutes from now`);
-      }
-
-      // 5. Working hours — slot must be within salon open hours on that day.
-      // Cloud Functions run in UTC; working_hours strings are in the salon's local time,
-      // so we must convert using the salon's timezone (defaults to Asia/Kolkata).
-      const tz = salon.timezone || "Asia/Kolkata";
-      const {weekday: dayKey, totalMinutes: startMin} = getLocalTimeParts(slotStart, tz);
-      const {totalMinutes: endMin} = getLocalTimeParts(slotEnd, tz);
-      const dayHours = salon.working_hours?.[dayKey];
-      if (!dayHours || dayHours.is_closed === true) {
-        return cancelBooking("SALON_CLOSED: Salon is closed on this day");
-      }
-      const openMin = parseTimeToMinutes(dayHours.open);
-      const closeMin = parseTimeToMinutes(dayHours.close);
-      if (startMin < openMin || endMin > closeMin) {
-        return cancelBooking("OUTSIDE_WORKING_HOURS: Slot is outside salon working hours");
-      }
-
-      // 6. Capacity check — count non-cancelled bookings overlapping this slot
-      const dayStart = new Date(slotStart);
-      dayStart.setHours(0, 0, 0, 0);
-      const dayEnd = new Date(dayStart);
-      dayEnd.setDate(dayEnd.getDate() + 1);
-
-      const bookingsSnap = await db.collection("bookings")
-        .where("salon_id", "==", salonId)
-        .where("slot_start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
-        .where("slot_start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
-        .get();
-
-      const maxBookings = salon.max_bookings_per_slot ?? 1;
-      const overlapping = bookingsSnap.docs.filter((doc) => {
-        if (doc.id === bookingId) return false;
-        const d = doc.data();
-        if (d.status === "cancelled") return false;
-        const bStart = d.slot_start?.toDate?.();
-        const bEnd = d.slot_end?.toDate?.();
-        if (!bStart || !bEnd) return false;
-        return bStart < slotEnd && bEnd > slotStart; // interval overlap
+      // 4-7. Lead time, working hours, capacity, blocked slots — shared with the
+      // reschedule and support paths so all three agree on what a valid slot is.
+      const verdict = await validateSlotForSalon(db, {
+        salon,
+        salonId,
+        slotStartMs: slotStart.getTime(),
+        slotEndMs: slotEnd.getTime(),
+        excludeBookingId: bookingId,
       });
-      if (overlapping.length >= maxBookings) {
-        return cancelBooking("SLOT_FULL: This time slot is fully booked");
-      }
-
-      // 7. Blocked slots — fetch day's blocks and check overlap in memory
-      const blockedSnap = await db.collection("salons").doc(salonId)
-        .collection("blocked_slots")
-        .where("start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
-        .where("start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
-        .get();
-
-      const isBlocked = blockedSnap.docs.some((doc) => {
-        const d = doc.data();
-        const bStart = d.start?.toDate?.();
-        const bEnd = d.end?.toDate?.();
-        if (!bStart || !bEnd) return false;
-        return bStart < slotEnd && bEnd > slotStart;
-      });
-      if (isBlocked) {
-        return cancelBooking("SLOT_BLOCKED: This time slot is blocked by the salon");
-      }
+      if (!verdict.ok) return cancelBooking(verdict.message);
 
       // All checks passed — booking stays "pending"
       logger.info("Booking validation passed", {bookingId, salonId});
@@ -763,135 +769,52 @@ exports.validateBookingOnCreate = onDocumentCreated(
 );
 
 // ── Reschedule booking ────────────────────────────────────────────────────────
-// Validates new slot (same 5 checks as onCreate) then updates the booking in-place.
-// If booking was "confirmed", status reverts to "pending" and salon owner is notified.
-// If booking was "pending", status stays "pending" and no notification is sent.
-exports.rescheduleBooking = onCall(async (request) => {
-  const auth = request.auth;
-  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+// Validates the new slot (the same five checks as onCreate) then updates the
+// booking in place. A "confirmed" booking reverts to "pending" and the salon
+// owner is notified; a "pending" one stays pending and nobody is notified.
 
-  const {bookingId, newSlotStartMs: rawMs} = request.data || {};
-  const newSlotStartMs = Number(rawMs);
-  if (!bookingId || !newSlotStartMs || isNaN(newSlotStartMs)) {
-    throw new HttpsError("invalid-argument", "bookingId and newSlotStartMs are required.");
+/**
+ * Bounds on where a booking may be moved to, in both directions.
+ *
+ * Every timestamp maps to some weekday and hour, so without an upper bound a
+ * typo'd millisecond value books a slot in the year 12025 and passes every
+ * check. The lower bound only bites an ADMIN override — SLOT_TOO_SOON stops
+ * everyone else — but an override moving a booking years into the past writes
+ * nonsense. A day of slack keeps the legitimate case: correcting the time of a
+ * visit that has just happened.
+ */
+const MAX_RESCHEDULE_AHEAD_MS = 2 * 365 * 24 * 60 * 60 * 1000;
+const MAX_RESCHEDULE_BEHIND_MS = 24 * 60 * 60 * 1000;
+
+function assertSaneSlotStart(ms) {
+  const now = Date.now();
+  if (!Number.isFinite(ms) ||
+      ms > now + MAX_RESCHEDULE_AHEAD_MS ||
+      ms < now - MAX_RESCHEDULE_BEHIND_MS) {
+    throw new HttpsError("invalid-argument", "That date is out of range.");
   }
+}
 
-  const db = admin.firestore();
-  const userId = auth.uid;
-
-  // Fetch booking
-  const bookingRef = db.collection("bookings").doc(bookingId);
-  const bookingSnap = await bookingRef.get();
-  if (!bookingSnap.exists) throw new HttpsError("not-found", "Booking not found.");
-  const booking = bookingSnap.data();
-
-  // Ownership check
-  if (booking.user_id !== userId) {
-    throw new HttpsError("permission-denied", "Not your booking.");
-  }
-
-  // Status check — only pending / confirmed can be rescheduled
-  if (booking.status !== "pending" && booking.status !== "confirmed") {
-    throw new HttpsError(
-      "failed-precondition",
-      "Only pending or confirmed bookings can be rescheduled.",
-    );
-  }
-
-  // Compute new end by preserving total duration
+/**
+ * Move a booking to a new start, preserving its total duration.
+ *
+ * Shared by the customer's rescheduleBooking and the panel's
+ * supportRescheduleBooking so the per-service re-laying and the salon
+ * notification have exactly one implementation. Assumes the slot has already
+ * been validated (or deliberately overridden) by the caller.
+ *
+ * @returns {{wasConfirmed: boolean, newSlotStartMs: number, newSlotEndMs: number}}
+ */
+async function applyReschedule(db, bookingRef, booking, newSlotStartMs, extraFields = null) {
   const oldStartMs = booking.slot_start?.toDate?.()?.getTime?.() ?? 0;
   const oldEndMs = booking.slot_end?.toDate?.()?.getTime?.() ?? 0;
   const totalDurationMs = oldEndMs - oldStartMs;
+  const newSlotEndMs = newSlotStartMs + totalDurationMs;
 
-  const newSlotStart = new Date(newSlotStartMs);
-  const newSlotEnd = new Date(newSlotStartMs + totalDurationMs);
-
-  // ── 1. Far enough in the future (admin-configurable, minus the grace) ───
-  const now = new Date();
-  const minLeadMs = await serverMinLeadMs();
-  const minTime = new Date(now.getTime() + minLeadMs);
-  if (newSlotStart < minTime) {
-    throw new HttpsError(
-      "failed-precondition",
-      `SLOT_TOO_SOON: New slot must be at least ${Math.round(minLeadMs / 60000)} minutes from now.`,
-    );
-  }
-
-  const salonId = booking.salon_id;
-
-  // ── 2. Salon exists and is active ────────────────────────────────────────
-  const salonSnap = await db.collection("salons").doc(salonId).get();
-  if (!salonSnap.exists || salonSnap.data().is_active === false) {
-    throw new HttpsError("failed-precondition", "SALON_NOT_FOUND: Salon not found or inactive.");
-  }
-  const salon = salonSnap.data();
-
-  // ── 3. Working hours ─────────────────────────────────────────────────────
-  const tz = salon.timezone || "Asia/Kolkata";
-  const {weekday: dayKey, totalMinutes: startMin} = getLocalTimeParts(newSlotStart, tz);
-  const {totalMinutes: endMin} = getLocalTimeParts(newSlotEnd, tz);
-  const dayHours = salon.working_hours?.[dayKey];
-  if (!dayHours || dayHours.is_closed === true) {
-    throw new HttpsError("failed-precondition", "SALON_CLOSED: Salon is closed on this day.");
-  }
-  const openMin = parseTimeToMinutes(dayHours.open);
-  const closeMin = parseTimeToMinutes(dayHours.close);
-  if (startMin < openMin || endMin > closeMin) {
-    throw new HttpsError(
-      "failed-precondition",
-      "OUTSIDE_WORKING_HOURS: Slot is outside salon working hours.",
-    );
-  }
-
-  // ── 4. Capacity check ────────────────────────────────────────────────────
-  const dayStart = new Date(newSlotStart);
-  dayStart.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(dayStart);
-  dayEnd.setDate(dayEnd.getDate() + 1);
-
-  const bookingsSnap = await db.collection("bookings")
-    .where("salon_id", "==", salonId)
-    .where("slot_start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
-    .where("slot_start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
-    .get();
-
-  const maxBookings = salon.max_bookings_per_slot ?? 1;
-  const overlapping = bookingsSnap.docs.filter((doc) => {
-    if (doc.id === bookingId) return false; // exclude the booking being rescheduled
-    const d = doc.data();
-    if (d.status === "cancelled") return false;
-    const bStart = d.slot_start?.toDate?.();
-    const bEnd = d.slot_end?.toDate?.();
-    if (!bStart || !bEnd) return false;
-    return bStart < newSlotEnd && bEnd > newSlotStart;
-  });
-  if (overlapping.length >= maxBookings) {
-    throw new HttpsError("failed-precondition", "SLOT_FULL: This time slot is fully booked.");
-  }
-
-  // ── 5. Blocked slots ─────────────────────────────────────────────────────
-  const blockedSnap = await db.collection("salons").doc(salonId)
-    .collection("blocked_slots")
-    .where("start", ">=", admin.firestore.Timestamp.fromDate(dayStart))
-    .where("start", "<", admin.firestore.Timestamp.fromDate(dayEnd))
-    .get();
-
-  const isBlocked = blockedSnap.docs.some((doc) => {
-    const d = doc.data();
-    const bStart = d.start?.toDate?.();
-    const bEnd = d.end?.toDate?.();
-    if (!bStart || !bEnd) return false;
-    return bStart < newSlotEnd && bEnd > newSlotStart;
-  });
-  if (isBlocked) {
-    throw new HttpsError("failed-precondition", "SLOT_BLOCKED: This time slot is blocked by the salon.");
-  }
-
-  // ── All checks passed — build the update ─────────────────────────────────
   const wasConfirmed = booking.status === "confirmed";
   const isNewFormat = Array.isArray(booking.services) && booking.services.length > 0;
 
-  // Recompute per-service windows preserving original durations
+  // Recompute per-service windows, preserving each service's original duration.
   let updatedServices = null;
   if (isNewFormat) {
     let cursor = newSlotStartMs;
@@ -902,33 +825,37 @@ exports.rescheduleBooking = onCall(async (request) => {
       cursor = svcEndMs;
       return {
         ...svc,
-        slot_start: admin.firestore.Timestamp.fromMillis(svcStartMs),
-        slot_end: admin.firestore.Timestamp.fromMillis(svcEndMs),
+        slot_start: Timestamp.fromMillis(svcStartMs),
+        slot_end: Timestamp.fromMillis(svcEndMs),
       };
     });
   }
 
   const updateData = {
-    slot_start: admin.firestore.Timestamp.fromDate(newSlotStart),
-    slot_end: admin.firestore.Timestamp.fromDate(newSlotEnd),
-    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    slot_start: Timestamp.fromMillis(newSlotStartMs),
+    slot_end: Timestamp.fromMillis(newSlotEndMs),
+    updated_at: FieldValue.serverTimestamp(),
   };
   if (updatedServices) updateData.services = updatedServices;
   if (wasConfirmed) updateData.status = "pending";
+  // The panel folds its audit entry in here rather than writing a second time:
+  // one document version, one trigger firing, one thing to reason about.
+  if (extraFields) Object.assign(updateData, extraFields);
 
   await bookingRef.update(updateData);
-  logger.info("Booking rescheduled", {bookingId, userId, wasConfirmed});
 
-  // ── Notify salon owner if booking was confirmed ───────────────────────────
+  // ── Notify the salon owner if the booking had already been confirmed ───────
+  // A pending booking that moves needs no push: nobody has committed to it yet.
   if (wasConfirmed) {
     try {
+      const salonId = booking.salon_id;
       const ownerSnap = await db.collection("salons").doc(salonId).get();
       const ownerUid = ownerSnap.exists ? ownerSnap.data()?.owner_uid : null;
       if (ownerUid) {
         const ownerProfile = await getUserProfile(ownerUid);
         const ownerToken = ownerProfile?.fcm_token;
         if (ownerToken) {
-          const slotText = newSlotStart.toISOString().replace("T", " ").slice(0, 16);
+          const slotText = new Date(newSlotStartMs).toISOString().replace("T", " ").slice(0, 16);
           const svcLabel = isNewFormat ?
             booking.services.map((s) => s.service_name).join(", ") :
             (booking.service_name || "appointment");
@@ -939,7 +866,7 @@ exports.rescheduleBooking = onCall(async (request) => {
               body: `A customer rescheduled their ${svcLabel} to ${slotText}.`,
             },
             data: {
-              booking_id: String(bookingId),
+              booking_id: String(bookingRef.id),
               salonId: String(salonId),
               type: "booking_rescheduled",
               new_slot_start: String(newSlotStartMs),
@@ -950,14 +877,96 @@ exports.rescheduleBooking = onCall(async (request) => {
             },
             apns: {payload: {aps: {sound: "default", badge: 1}}},
           });
-          logger.info("Sent reschedule notification to salon", {bookingId, ownerUid});
+          logger.info("Sent reschedule notification to salon", {bookingId: bookingRef.id, ownerUid});
         }
       }
     } catch (notifErr) {
-      // Non-fatal — the reschedule already succeeded
-      logger.error("Failed to send reschedule notification", {bookingId, err: notifErr});
+      // Non-fatal — the reschedule already succeeded.
+      logger.error("Failed to send reschedule notification", {bookingId: bookingRef.id, err: notifErr});
     }
   }
+
+  return {wasConfirmed, newSlotStartMs, newSlotEndMs};
+}
+
+/**
+ * Load a booking and its salon, refusing anything that cannot be rescheduled.
+ * Shared by the customer and support reschedule paths; the caller supplies the
+ * ownership rule, which is the only thing that differs between them.
+ */
+async function loadReschedulable(db, bookingId) {
+  const bookingRef = db.collection("bookings").doc(bookingId);
+  const bookingSnap = await bookingRef.get();
+  if (!bookingSnap.exists) throw new HttpsError("not-found", "Booking not found.");
+  const booking = bookingSnap.data();
+
+  if (booking.status !== "pending" && booking.status !== "confirmed") {
+    throw new HttpsError(
+      "failed-precondition",
+      "Only pending or confirmed bookings can be rescheduled.",
+    );
+  }
+
+  // A reschedule preserves the visit's length, so a booking without a usable one
+  // has nothing to preserve. Left unchecked the duration comes out as 0 and the
+  // move writes slot_end === slot_start — a zero-length booking. The customer
+  // path only ever failed here with a confusing "outside working hours"; the
+  // panel's override would have written the corrupt document.
+  const startMs = booking.slot_start?.toDate?.()?.getTime?.();
+  const endMs = booking.slot_end?.toDate?.()?.getTime?.();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This booking has no valid time range, so it cannot be moved.",
+    );
+  }
+
+  // doc(undefined) throws inside the SDK and surfaces as an opaque INTERNAL.
+  if (!booking.salon_id) {
+    throw new HttpsError("failed-precondition", "This booking has no salon.");
+  }
+  const salonSnap = await db.collection("salons").doc(booking.salon_id).get();
+  if (!salonSnap.exists || salonSnap.data().is_active === false) {
+    throw new HttpsError("failed-precondition", "SALON_NOT_FOUND: Salon not found or inactive.");
+  }
+
+  return {bookingRef, booking, salon: salonSnap.data()};
+}
+
+exports.rescheduleBooking = onCall(async (request) => {
+  const auth = request.auth;
+  if (!auth) throw new HttpsError("unauthenticated", "Must be signed in.");
+
+  const {bookingId, newSlotStartMs: rawMs} = request.data || {};
+  const newSlotStartMs = Number(rawMs);
+  if (!bookingId || !newSlotStartMs || isNaN(newSlotStartMs)) {
+    throw new HttpsError("invalid-argument", "bookingId and newSlotStartMs are required.");
+  }
+  assertSaneSlotStart(newSlotStartMs);
+
+  const db = admin.firestore();
+  const userId = auth.uid;
+
+  const {bookingRef, booking, salon} = await loadReschedulable(db, bookingId);
+
+  // Ownership — a customer may only move their own booking.
+  if (booking.user_id !== userId) {
+    throw new HttpsError("permission-denied", "Not your booking.");
+  }
+
+  const oldStartMs = booking.slot_start?.toDate?.()?.getTime?.() ?? 0;
+  const oldEndMs = booking.slot_end?.toDate?.()?.getTime?.() ?? 0;
+  const verdict = await validateSlotForSalon(db, {
+    salon,
+    salonId: booking.salon_id,
+    slotStartMs: newSlotStartMs,
+    slotEndMs: newSlotStartMs + (oldEndMs - oldStartMs),
+    excludeBookingId: bookingId,
+  });
+  if (!verdict.ok) throw new HttpsError("failed-precondition", verdict.message);
+
+  const {wasConfirmed} = await applyReschedule(db, bookingRef, booking, newSlotStartMs);
+  logger.info("Booking rescheduled", {bookingId, userId, wasConfirmed});
 
   return {success: true, wasConfirmed};
 });
@@ -1011,7 +1020,7 @@ exports.onBookingStatusChanged = onDocumentUpdated(
         ) {
           logger.warn("Stale FCM token — removing", {recipientId, recipientType});
           await admin.firestore().collection("Users").doc(recipientId)
-            .update({fcm_token: admin.firestore.FieldValue.delete()})
+            .update({fcm_token: FieldValue.delete()})
             .catch(() => {});
         } else {
           logger.error("Failed to send booking status notification", {bookingId, recipientId, err});
@@ -1395,51 +1404,82 @@ exports.supportListBookings = onCall(async (request) => {
     if (d.exists) userMap[d.id] = d.data();
   });
 
-  const result = bookings.map((b) => {
-    const salon = salonMap[b.salon_id] || {};
-    const user = userMap[b.user_id] || {};
-    const services = Array.isArray(b.services) && b.services.length ?
-      b.services.map((s) => ({
-        name: s.service_name || "",
-        price: s.service_price || 0,
-        duration_minutes: s.duration_minutes || 0,
-      })) :
-      (b.service_id ? [{name: b.service_name || "Service", price: b.service_price || 0}] : []);
-    return {
-      id: b.id,
-      status: b.status || "pending",
-      created_at_ms: toMs(b.created_at),
-      slot_start_ms: toMs(b.slot_start),
-      slot_end_ms: toMs(b.slot_end),
-      salon_id: b.salon_id || "",
-      salon_name: b.salon_name || salon.name || "",
-      salon_phone: salon.phone || "",
-      salon_city: salon.city || "",
-      user_id: b.user_id || "",
-      // Walk-ins have no user_id; their name/phone live on the booking itself.
-      customer_name: user.name || b.customer_name || "",
-      customer_phone: user.phone || b.customer_phone || "",
-      is_walk_in: b.is_walk_in === true,
-      // "Book for someone else" — booking placed by the account holder for a
-      // third party. The beneficiary is who gets served; customer_name above
-      // remains the account holder (the person who actually booked).
-      booked_for_other: b.booked_for_other === true,
-      beneficiary_name: b.beneficiary_name || "",
-      beneficiary_phone: b.beneficiary_phone || "",
-      beneficiary_gender: b.beneficiary_gender || "",
-      services,
-      total_service_price: b.total_service_price ?? b.service_price ?? 0,
-      booking_fee: b.booking_fee ?? 0,
-      discount_amount: b.discount_amount ?? 0,
-      final_amount: b.final_amount ?? 0,
-      notes: b.notes || "",
-      coupon_code: b.coupon_code || null,
-      support_called_salon: b.support_called_salon === true,
-      support_called_customer: b.support_called_customer === true,
-    };
-  });
+  const result = bookings.map((b) =>
+    projectBooking(b.id, b, salonMap[b.salon_id] || {}, userMap[b.user_id] || {}));
   return {bookings: result};
 });
+
+/**
+ * The panel's view of a booking: the document joined with its salon and customer.
+ *
+ * The action callables return this same shape for the single booking they
+ * touched, so the client merges the result straight into its list instead of
+ * reloading all 500.
+ */
+function projectBooking(id, b, salon = {}, user = {}) {
+  const services = Array.isArray(b.services) && b.services.length ?
+    b.services.map((s) => ({
+      name: s.service_name || "",
+      price: s.service_price || 0,
+      duration_minutes: s.duration_minutes || 0,
+    })) :
+    (b.service_id ? [{name: b.service_name || "Service", price: b.service_price || 0}] : []);
+  return {
+    id,
+    status: b.status || "pending",
+    created_at_ms: toMs(b.created_at),
+    slot_start_ms: toMs(b.slot_start),
+    slot_end_ms: toMs(b.slot_end),
+    salon_id: b.salon_id || "",
+    salon_name: b.salon_name || salon.name || "",
+    salon_phone: salon.phone || "",
+    salon_city: salon.city || "",
+    salon_timezone: salon.timezone || "Asia/Kolkata",
+    user_id: b.user_id || "",
+    // Walk-ins have no user_id; their name/phone live on the booking itself.
+    customer_name: user.name || b.customer_name || "",
+    customer_phone: user.phone || b.customer_phone || "",
+    is_walk_in: b.is_walk_in === true,
+    // "Book for someone else" — booking placed by the account holder for a
+    // third party. The beneficiary is who gets served; customer_name above
+    // remains the account holder (the person who actually booked).
+    booked_for_other: b.booked_for_other === true,
+    beneficiary_name: b.beneficiary_name || "",
+    beneficiary_phone: b.beneficiary_phone || "",
+    beneficiary_gender: b.beneficiary_gender || "",
+    stylist_id: b.stylist_id || null,
+    services,
+    total_service_price: b.total_service_price ?? b.service_price ?? 0,
+    booking_fee: b.booking_fee ?? 0,
+    discount_amount: b.discount_amount ?? 0,
+    final_amount: b.final_amount ?? 0,
+    notes: b.notes || "",
+    coupon_code: b.coupon_code || null,
+    cancelled_by: b.cancelled_by || null,
+    cancellation_reason: b.cancellation_reason || null,
+    support_called_salon: b.support_called_salon === true,
+    support_called_customer: b.support_called_customer === true,
+    support_actions: (Array.isArray(b.support_actions) ? b.support_actions : [])
+      .map(({at, ...rest}) => ({...rest, at_ms: toMs(at)})),
+  };
+}
+
+/** Re-read a booking and project it with its salon + customer joined in. */
+async function reprojectBooking(db, bookingId) {
+  const snap = await db.collection("bookings").doc(bookingId).get();
+  if (!snap.exists) throw new HttpsError("not-found", "Booking not found.");
+  const b = snap.data();
+  const [salonSnap, userSnap] = await Promise.all([
+    b.salon_id ? db.collection("salons").doc(b.salon_id).get() : null,
+    b.user_id ? db.collection("Users").doc(b.user_id).get() : null,
+  ]);
+  return projectBooking(
+    bookingId,
+    b,
+    salonSnap && salonSnap.exists ? salonSnap.data() : {},
+    userSnap && userSnap.exists ? userSnap.data() : {},
+  );
+}
 
 exports.markSupportCall = onCall(async (request) => {
   await requireRole(request.auth, ["ADMIN", "SUPPORT"]);
@@ -1455,7 +1495,7 @@ exports.markSupportCall = onCall(async (request) => {
 
   await ref.update({
     [field]: done === true,
-    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    updated_at: FieldValue.serverTimestamp(),
   });
   const after = (await ref.get()).data() || {};
   return {
@@ -1464,6 +1504,258 @@ exports.markSupportCall = onCall(async (request) => {
   };
 });
 
+// ── Panel booking actions (ADMIN + SUPPORT) ───────────────────────────────────
+//
+// A rep on the phone can now fire every trigger a salon or a customer can, on
+// that party's behalf. The panel has no direct write access to bookings
+// (firestore.rules admits only the booking's own user or the salon's staff), so
+// these callables are the whole surface — they run on the Admin SDK.
+//
+// The party matters, not the operator. onBookingStatusChanged branches on
+// cancelled_by being exactly "salon" or "user" and returns silently for anything
+// else, so writing "admin" there would cancel bookings that notify nobody. The
+// rep picks whose behalf they are acting on, we write that value, and the
+// existing notification fan-out is correct for free. Who *actually* did it is
+// recorded in support_actions.
+
+/** ADMIN may push past a refusal; SUPPORT may not. */
+function assertMayOverride(role) {
+  if (role !== "ADMIN") {
+    throw new HttpsError(
+      "permission-denied",
+      "Only an admin can override booking validation.",
+    );
+  }
+}
+
+/**
+ * One audit entry per action, appended to the booking.
+ *
+ * Timestamp.now() rather than FieldValue.serverTimestamp(): Firestore rejects
+ * sentinel values inside array elements.
+ */
+function supportAuditEntry({action, actedAs, actor, reason, override, overrideCode}) {
+  return {
+    action,
+    acted_as: actedAs || null,
+    actor_uid: actor.uid,
+    actor_role: actor.role,
+    actor_name: actor.profile?.name || actor.profile?.email || "",
+    reason: reason || null,
+    override: override === true,
+    override_code: overrideCode || null,
+    at: Timestamp.now(),
+  };
+}
+
+const STATUS_ACTIONS = {
+  confirm: {
+    from: ["pending"],
+    actedAs: "salon",
+    apply: () => ({status: "confirmed"}),
+  },
+  cancel_by_salon: {
+    from: ["pending", "confirmed"],
+    actedAs: "salon",
+    apply: (reason) => ({
+      status: "cancelled",
+      cancelled_by: "salon",
+      cancellation_reason: reason || "Cancelled by salon",
+    }),
+  },
+  cancel_by_user: {
+    from: ["pending", "confirmed"],
+    actedAs: "user",
+    apply: (reason) => ({
+      status: "cancelled",
+      cancelled_by: "user",
+      cancellation_reason: reason || "Cancelled by customer",
+    }),
+  },
+};
+
+exports.supportUpdateBookingStatus = onCall(async (request) => {
+  const actor = await requireRole(request.auth, ["ADMIN", "SUPPORT"]);
+
+  const {bookingId, action, reason, override} = request.data || {};
+  if (!bookingId) throw new HttpsError("invalid-argument", "bookingId is required.");
+  const spec = Object.prototype.hasOwnProperty.call(STATUS_ACTIONS, action) ?
+    STATUS_ACTIONS[action] : null;
+  if (!spec) {
+    throw new HttpsError(
+      "invalid-argument",
+      `action must be one of: ${Object.keys(STATUS_ACTIONS).join(", ")}.`,
+    );
+  }
+  const cleanReason = String(reason || "").trim().slice(0, 500);
+
+  const db = admin.firestore();
+  const ref = db.collection("bookings").doc(bookingId);
+
+  // In a transaction because the status decides the write: two reps on the phone
+  // to the two sides of the same booking, or a rep and the salon's own
+  // dashboard, otherwise both read "pending" and both write. Losing that race
+  // means a customer gets a cancellation push for a booking left confirmed.
+  // The transaction re-reads and re-evaluates if the document moved underneath,
+  // which holds even though the dashboard writes without one.
+  let overrideCode = null;
+  let fromStatus = null;
+  await db.runTransaction(async (tx) => {
+    // Reset: a contended transaction runs this body more than once.
+    overrideCode = null;
+
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Booking not found.");
+    const booking = snap.data();
+    const status = booking.status || "pending";
+    fromStatus = status;
+
+    // A completed booking has already posted a sale to the salon's ledger;
+    // cancelling it here would leave the books showing a sale for a booking that
+    // no longer happened. Reversing that is the salon's Accounts screen, not this.
+    if (status === "completed") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This booking is completed and already posted to the salon's accounts. Reverse it from the salon dashboard instead.",
+      );
+    }
+
+    if (!spec.from.includes(status)) {
+      if (override !== true) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Cannot ${action.replace(/_/g, " ")} a ${status} booking.`,
+        );
+      }
+      assertMayOverride(actor.role);
+      overrideCode = `STATUS_${String(status).toUpperCase()}`;
+    }
+
+    tx.update(ref, {
+      ...spec.apply(cleanReason),
+      support_actions: FieldValue.arrayUnion(supportAuditEntry({
+        action,
+        actedAs: spec.actedAs,
+        actor,
+        reason: cleanReason,
+        override: overrideCode !== null,
+        overrideCode,
+      })),
+      updated_at: FieldValue.serverTimestamp(),
+    });
+  });
+
+  logger.info("Panel booking action", {
+    bookingId, action, actorUid: actor.uid, actorRole: actor.role, from: fromStatus, override: overrideCode,
+  });
+
+  return {booking: await reprojectBooking(db, bookingId)};
+});
+
+exports.supportRescheduleBooking = onCall(async (request) => {
+  const actor = await requireRole(request.auth, ["ADMIN", "SUPPORT"]);
+
+  const {bookingId, newSlotStartMs: rawMs, override} = request.data || {};
+  const newSlotStartMs = Number(rawMs);
+  if (!bookingId || !newSlotStartMs || isNaN(newSlotStartMs)) {
+    throw new HttpsError("invalid-argument", "bookingId and newSlotStartMs are required.");
+  }
+  assertSaneSlotStart(newSlotStartMs);
+
+  const db = admin.firestore();
+  const {bookingRef, booking, salon} = await loadReschedulable(db, bookingId);
+
+  const oldStartMs = booking.slot_start?.toDate?.()?.getTime?.() ?? 0;
+  const oldEndMs = booking.slot_end?.toDate?.()?.getTime?.() ?? 0;
+  const verdict = await validateSlotForSalon(db, {
+    salon,
+    salonId: booking.salon_id,
+    slotStartMs: newSlotStartMs,
+    slotEndMs: newSlotStartMs + (oldEndMs - oldStartMs),
+    excludeBookingId: bookingId,
+  });
+
+  let overrideCode = null;
+  if (!verdict.ok) {
+    // The rep may have phoned the salon and agreed to squeeze this in — an admin
+    // can say so, and what was overridden is recorded.
+    if (override !== true) throw new HttpsError("failed-precondition", verdict.message);
+    assertMayOverride(actor.role);
+    overrideCode = verdict.code;
+  }
+
+  const {wasConfirmed} = await applyReschedule(db, bookingRef, booking, newSlotStartMs, {
+    support_actions: FieldValue.arrayUnion(supportAuditEntry({
+      action: "reschedule",
+      actedAs: "user",
+      actor,
+      reason: null,
+      override: overrideCode !== null,
+      overrideCode,
+    })),
+  });
+
+  logger.info("Panel booking rescheduled", {
+    bookingId, actorUid: actor.uid, actorRole: actor.role, wasConfirmed, override: overrideCode,
+  });
+
+  return {wasConfirmed, booking: await reprojectBooking(db, bookingId)};
+});
+
+/**
+ * Bookable start times for one salon on one day, for the reschedule picker.
+ *
+ * Every candidate is run through the same checkSlot that the write path uses,
+ * against the same day window and the same rows — so a slot the grid shows as
+ * free cannot then be refused, and one shown as taken says why.
+ */
+exports.supportGetSalonDayAvailability = onCall(async (request) => {
+  await requireRole(request.auth, ["ADMIN", "SUPPORT"]);
+
+  const {salonId, dayStartMs: rawDay, durationMinutes, excludeBookingId} = request.data || {};
+  const dayStartMs = Number(rawDay);
+  if (!salonId || !dayStartMs || isNaN(dayStartMs)) {
+    throw new HttpsError("invalid-argument", "salonId and dayStartMs are required.");
+  }
+  const durationMin = Math.min(Math.max(Number(durationMinutes) || 30, 5), 8 * 60);
+
+  const db = admin.firestore();
+  const salonSnap = await db.collection("salons").doc(salonId).get();
+  if (!salonSnap.exists) throw new HttpsError("not-found", "Salon not found.");
+  const salon = salonSnap.data();
+
+  // Candidates cover the 24 hours the rep actually picked. utcDayWindow (which
+  // the write paths use) buckets by the *server's* midnight, so reusing it here
+  // would hand back a window shifted by the salon's UTC offset — the rep taps
+  // Thursday and is offered Wednesday teatime onwards.
+  const fromMs = dayStartMs;
+  const toMs = dayStartMs + 24 * 60 * 60 * 1000;
+
+  // Rows are fetched over a padded window so a booking that starts the previous
+  // evening and runs into this day still counts. That makes this a superset of
+  // what the write path sees, never a subset: a slot the grid shows as free is
+  // one the write path will also accept.
+  const dayContext = await loadDayContext(db, salonId, fromMs - 12 * 60 * 60 * 1000, toMs + 12 * 60 * 60 * 1000);
+
+  const availability = slots.buildDayAvailability({
+    salon,
+    dayContext,
+    fromMs,
+    toMs,
+    durationMs: durationMin * 60 * 1000,
+    stepMinutes: 15,
+    excludeBookingId: excludeBookingId || null,
+    minLeadMs: await serverMinLeadMs(),
+    nowMs: Date.now(),
+  });
+
+  return {
+    salon_id: salonId,
+    timezone: slots.salonTimezone(salon),
+    duration_minutes: durationMin,
+    slots: availability,
+  };
+});
 exports.createSupportRep = onCall(async (request) => {
   await requireRole(request.auth, ["ADMIN"]);
   const {email, name, phone} = request.data || {};
@@ -1507,7 +1799,7 @@ exports.createSupportRep = onCall(async (request) => {
     dob: "",
     Role: "SUPPORT",
     isEnabled: true,
-    created_at: admin.firestore.FieldValue.serverTimestamp(),
+    created_at: FieldValue.serverTimestamp(),
   }, {merge: true});
 
   try {
@@ -1610,7 +1902,7 @@ exports.ledgerRecordSale = onCall(async (request) => {
     if (l.posted) return "posted";
     const lockedAt = l.posting_at?.toMillis?.() || 0;
     if (l.posting && Date.now() - lockedAt < 60000) return "busy";
-    tx.set(bref, {ledger: {...l, posting: true, posting_at: admin.firestore.FieldValue.serverTimestamp()}}, {merge: true});
+    tx.set(bref, {ledger: {...l, posting: true, posting_at: FieldValue.serverTimestamp()}}, {merge: true});
     return "claimed";
   });
   if (claim === "missing") throw new HttpsError("not-found", "Booking was deleted.");
@@ -1621,14 +1913,14 @@ exports.ledgerRecordSale = onCall(async (request) => {
     const refs = await ledger.recordSaleForBooking(bookingId, {actorUid: request.auth?.uid});
     const update = {
       ledger: {...refs, posted: true, posting: false, error: null,
-        posted_at: admin.firestore.FieldValue.serverTimestamp()},
+        posted_at: FieldValue.serverTimestamp()},
     };
     // Customer-facing bill (stored so the salon and, later, the app can open it).
     update.bill = {
       url: refs.billUrl || null,
       invoiceNo: refs.invoiceNumber || null,
       error: refs.billError || null,
-      generated_at: admin.firestore.FieldValue.serverTimestamp(),
+      generated_at: FieldValue.serverTimestamp(),
     };
     await bref.set(update, {merge: true});
     return {posted: true, ledger: refs, bill: update.bill};
@@ -1652,7 +1944,7 @@ exports.ledgerReverseSale = onCall(async (request) => {
   if (!booking.ledger?.posted) return {reversed: false, reason: "not posted"};
   const results = await ledger.reverseSaleForBooking(bookingId, booking.ledger, reason);
   await bref.set({ledger: {...booking.ledger, posted: false, reversed: true, reverse_results: results,
-    reversed_at: admin.firestore.FieldValue.serverTimestamp()}}, {merge: true});
+    reversed_at: FieldValue.serverTimestamp()}}, {merge: true});
   return {reversed: true, results};
 });
 
@@ -1712,7 +2004,7 @@ exports.ledgerRecordCutqRemittance = onCall(async (request) => {
     amount: Number(amount), method: method === "BANK" ? "BANK" : "CASH",
     description: description || "CutQ booking-fee remittance",
     txnId: res.data?.transaction?.id || null, sourceId,
-    created_at: admin.firestore.FieldValue.serverTimestamp(),
+    created_at: FieldValue.serverTimestamp(),
   });
   return {success: true, txnId: res.data?.transaction?.id || null};
 });
@@ -1838,12 +2130,12 @@ exports.addSalonTeamMember = onCall({secrets: [SMTP_USER, SMTP_PASS]}, async (re
         modules: cleanModules,
         is_active: true,
         salon_name: salon.name || "",
-        added_at: admin.firestore.FieldValue.serverTimestamp(),
+        added_at: FieldValue.serverTimestamp(),
       },
     },
   };
   if (!existing.exists) {
-    Object.assign(userDoc, {profile_photo: "", gender: "", dob: "", created_at: admin.firestore.FieldValue.serverTimestamp()});
+    Object.assign(userDoc, {profile_photo: "", gender: "", dob: "", created_at: FieldValue.serverTimestamp()});
   }
 
   // All three Firestore writes are committed atomically so a membership can
@@ -1853,10 +2145,10 @@ exports.addSalonTeamMember = onCall({secrets: [SMTP_USER, SMTP_PASS]}, async (re
   batch.set(db.collection("salons").doc(salonId).collection("team").doc(uid), {
     uid, name: String(name || "").trim(), email: cleanEmail, phone: String(phone || "").trim(),
     modules: cleanModules, is_active: true,
-    created_at: admin.firestore.FieldValue.serverTimestamp(),
-    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    created_at: FieldValue.serverTimestamp(),
+    updated_at: FieldValue.serverTimestamp(),
   }, {merge: true});
-  batch.update(db.collection("salons").doc(salonId), {team_uids: admin.firestore.FieldValue.arrayUnion(uid)});
+  batch.update(db.collection("salons").doc(salonId), {team_uids: FieldValue.arrayUnion(uid)});
   await batch.commit();
 
   try {
@@ -1901,7 +2193,7 @@ exports.updateSalonTeamMember = onCall(async (request) => {
   if (!memberUid) throw new HttpsError("invalid-argument", "memberUid is required.");
   const db = admin.firestore();
 
-  const teamPatch = {updated_at: admin.firestore.FieldValue.serverTimestamp()};
+  const teamPatch = {updated_at: FieldValue.serverTimestamp()};
   const accessPatch = {};
   if (modules !== undefined) {
     const clean = sanitizeModules(modules);
@@ -1923,8 +2215,8 @@ exports.removeSalonTeamMember = onCall(async (request) => {
   if (!memberUid) throw new HttpsError("invalid-argument", "memberUid is required.");
   const db = admin.firestore();
   await db.collection("salons").doc(salonId).collection("team").doc(memberUid).delete();
-  await db.collection("salons").doc(salonId).update({team_uids: admin.firestore.FieldValue.arrayRemove(memberUid)});
-  await db.collection("Users").doc(memberUid).update({[`salon_access.${salonId}`]: admin.firestore.FieldValue.delete()});
+  await db.collection("salons").doc(salonId).update({team_uids: FieldValue.arrayRemove(memberUid)});
+  await db.collection("Users").doc(memberUid).update({[`salon_access.${salonId}`]: FieldValue.delete()});
   try {
  await refreshUserClaims(memberUid);
 } catch (err) {
@@ -2145,7 +2437,7 @@ exports.onReportResolved = onDocumentUpdated(
     } catch (err) {
       if (err.code === "messaging/registration-token-not-registered" ||
           err.code === "messaging/invalid-registration-token") {
-        await db.collection("Users").doc(userId).update({fcm_token: admin.firestore.FieldValue.delete()}).catch(() => {});
+        await db.collection("Users").doc(userId).update({fcm_token: FieldValue.delete()}).catch(() => {});
       } else {
         logger.error("onReportResolved: FCM failed", {reportId, err});
       }

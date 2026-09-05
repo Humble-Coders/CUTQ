@@ -143,7 +143,7 @@ export default function AdminPanel({ role }) {
           {tab === "salons_list"     && !isSupport && <Salons />}
           {tab === "add_salon"       && !isSupport && <AddSalon initialData={prefillSubmission} onCreated={() => setPrefillSubmission(null)} />}
           {tab === "categories"      && !isSupport && <Categories />}
-          {tab === "bookings"        && <BookingsSupport />}
+          {tab === "bookings"        && <BookingsSupport role={role} />}
           {tab === "support_reps"    && !isSupport && <SupportReps />}
           {tab === "reports"         && !isSupport && <Reports />}
           {tab === "partner_requests" && !isSupport && <PartnerRequests />}

@@ -622,6 +622,38 @@ export async function markSupportCall(bookingId, target, done) {
   return res.data;
 }
 
+// ─── Panel booking actions (ADMIN + SUPPORT) ──────────────────────────────
+//
+// The panel has no direct write access to bookings (firestore.rules admits only
+// the booking's own user or the salon's staff), so every action below goes
+// through a callable running on the Admin SDK. Each returns the same projected
+// booking shape supportListBookings emits, so the caller merges rather than
+// reloads.
+
+// action: "confirm" | "cancel_by_salon" | "cancel_by_user"; returns { booking }
+export async function supportUpdateBookingStatus(bookingId, action, {reason = "", override = false} = {}) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "supportUpdateBookingStatus");
+  const res = await call({ bookingId, action, reason, override });
+  return res.data?.booking ?? null;
+}
+
+// returns { wasConfirmed, booking }
+export async function supportRescheduleBooking(bookingId, newSlotStartMs, {override = false} = {}) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "supportRescheduleBooking");
+  const res = await call({ bookingId, newSlotStartMs, override });
+  return res.data;
+}
+
+// returns { timezone, duration_minutes, slots: [{ start_ms, label, free, code }] }
+export async function supportGetSalonDayAvailability(salonId, dayStartMs, durationMinutes, excludeBookingId) {
+  if (!functions) throw new Error("Firebase Functions is not configured.");
+  const call = httpsCallable(functions, "supportGetSalonDayAvailability");
+  const res = await call({ salonId, dayStartMs, durationMinutes, excludeBookingId });
+  return res.data;
+}
+
 // returns { uid, email, password, isExisting }
 export async function createSupportRep(email, name, phone) {
   if (!functions) throw new Error("Firebase Functions is not configured.");

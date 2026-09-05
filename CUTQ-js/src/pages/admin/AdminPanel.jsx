@@ -11,7 +11,7 @@ import SupportReps from "./tabs/SupportReps";
 import Reports from "./tabs/Reports";
 import PartnerRequests from "./tabs/PartnerRequests";
 import SalonSubmissions from "./tabs/SalonSubmissions";
-import { listenAppConfig, updateBookingFee } from "../../lib/adminFirestore";
+import { listenAppConfig, updateBookingFee, updateBookingLeadMinutes } from "../../lib/adminFirestore";
 
 const ADMIN_TABS = [
   { id: "salons_list",     label: "Salons" },
@@ -41,15 +41,39 @@ export default function AdminPanel({ role }) {
   const [bookingFee, setBookingFee] = useState(0);
   const [feeInput, setFeeInput] = useState("0");
   const [savingFee, setSavingFee] = useState(false);
+  const [leadMinutes, setLeadMinutes] = useState(30);
+  const [leadInput, setLeadInput] = useState("30");
+  const [savingLead, setSavingLead] = useState(false);
 
   useEffect(() => {
     if (isSupport) return; // support reps don't manage global config
     const unsub = listenAppConfig(config => {
       setBookingFee(config.booking_fee ?? 0);
       setFeeInput(String(config.booking_fee ?? 0));
+      setLeadMinutes(config.booking_min_lead_minutes ?? 30);
+      setLeadInput(String(config.booking_min_lead_minutes ?? 30));
     });
     return unsub;
   }, [isSupport]);
+
+  async function handleSaveLead() {
+    const n = Number(leadInput);
+    // Below 10 the server grace window (5 min) would leave almost no room, and a very large
+    // value silently makes same-day booking impossible.
+    if (!Number.isFinite(n) || n < 10 || n > 240) {
+      toast.error("Enter a lead time between 10 and 240 minutes");
+      return;
+    }
+    setSavingLead(true);
+    try {
+      await updateBookingLeadMinutes(n);
+      toast.success("Booking lead time updated");
+    } catch {
+      toast.error("Failed to update lead time");
+    } finally {
+      setSavingLead(false);
+    }
+  }
 
   async function handleSaveFee() {
     setSavingFee(true);
@@ -82,6 +106,18 @@ export default function AdminPanel({ role }) {
             <button onClick={handleSaveFee} disabled={savingFee || feeInput === String(bookingFee)}
               className="px-3 py-1 text-xs rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-40 transition-colors">
               {savingFee ? "Saving…" : "Save"}
+            </button>
+
+            <span className="w-px h-5 bg-white/10 mx-1" />
+
+            <span className="text-xs text-gray-400" title="Customers can only pick slots at least this far ahead. The server accepts a slot 5 minutes sooner so a slow checkout isn't rejected.">
+              Min booking lead (min)
+            </span>
+            <input type="number" min="10" max="240" value={leadInput} onChange={e => setLeadInput(e.target.value)}
+              className="w-20 bg-white/10 border border-white/10 rounded px-2 py-1 text-sm text-white outline-none focus:border-[#18B79B] text-center" />
+            <button onClick={handleSaveLead} disabled={savingLead || leadInput === String(leadMinutes)}
+              className="px-3 py-1 text-xs rounded bg-[#18B79B] text-white hover:bg-[#15a389] disabled:opacity-40 transition-colors">
+              {savingLead ? "Saving…" : "Save"}
             </button>
           </div>
         )}

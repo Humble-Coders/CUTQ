@@ -111,11 +111,27 @@ function configRef() {
 
 export function listenAppConfig(callback) {
   if (!db) {
-    callback({ booking_fee: 0 });
+    callback({ booking_fee: 0, booking_min_lead_minutes: 30 });
     return () => {};
   }
   return onSnapshot(configRef(), snap => {
-    callback(snap.exists() ? snap.data() : { booking_fee: 0 });
+    callback(snap.exists() ? snap.data() : { booking_fee: 0, booking_min_lead_minutes: 30 });
+  });
+}
+
+/**
+ * Minimum minutes ahead a customer may book. The apps only OFFER slots this far out; the
+ * Cloud Functions accept a slot five minutes sooner, so a customer who takes a few minutes
+ * to check out is not rejected at the last step. Change this one number and both follow.
+ */
+export async function updateBookingLeadMinutes(minutes) {
+  const _db = requireDb();
+  await runTransaction(_db, async tx => {
+    const ref_ = configRef();
+    const snap = await tx.get(ref_);
+    const patch = { booking_min_lead_minutes: Number(minutes), updated_at: serverTimestamp() };
+    if (snap.exists()) tx.update(ref_, patch);
+    else tx.set(ref_, patch);
   });
 }
 
@@ -571,6 +587,22 @@ export function listenPrivacyPolicy(type, callback) {
 
 export async function savePrivacyPolicy(type, html) {
   const id = type === "salon" ? "privacy_policy_salon" : "privacy_policy_user";
+  await setDoc(supportDocRef(id), { html, updated_at: serverTimestamp() }, { merge: true });
+}
+
+// ── Terms & Conditions ────────────────────────────────────────────────
+// Same shape and same `support/{docId}` rule as the privacy policy: public read, admin write.
+//   support/terms_user   → html: string
+export function listenTerms(type, callback) {
+  const id = type === "salon" ? "terms_salon" : "terms_user";
+  if (!db) { callback({ html: "" }); return () => {}; }
+  return onSnapshot(supportDocRef(id), snap => {
+    callback(snap.exists() ? snap.data() : { html: "" });
+  });
+}
+
+export async function saveTerms(type, html) {
+  const id = type === "salon" ? "terms_salon" : "terms_user";
   await setDoc(supportDocRef(id), { html, updated_at: serverTimestamp() }, { merge: true });
 }
 

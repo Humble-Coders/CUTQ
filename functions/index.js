@@ -684,11 +684,13 @@ exports.validateBookingOnCreate = onDocumentCreated(
         }
       }
 
-      // 4. Slot must be at least 25 minutes in the future
+      // 4. Slot must be far enough in the future (admin-configurable, minus the grace).
       const now = new Date();
-      const minTime = new Date(now.getTime() + 25 * 60 * 1000);
+      const minLeadMs = await serverMinLeadMs();
+      const minTime = new Date(now.getTime() + minLeadMs);
       if (slotStart < minTime) {
-        return cancelBooking("SLOT_TOO_SOON: Slot must be at least 25 minutes from now");
+        return cancelBooking(
+          `SLOT_TOO_SOON: Slot must be at least ${Math.round(minLeadMs / 60000)} minutes from now`);
       }
 
       // 5. Working hours — slot must be within salon open hours on that day.
@@ -804,13 +806,14 @@ exports.rescheduleBooking = onCall(async (request) => {
   const newSlotStart = new Date(newSlotStartMs);
   const newSlotEnd = new Date(newSlotStartMs + totalDurationMs);
 
-  // ── 1. At least 25 min in the future ────────────────────────────────────
+  // ── 1. Far enough in the future (admin-configurable, minus the grace) ───
   const now = new Date();
-  const minTime = new Date(now.getTime() + 25 * 60 * 1000);
+  const minLeadMs = await serverMinLeadMs();
+  const minTime = new Date(now.getTime() + minLeadMs);
   if (newSlotStart < minTime) {
     throw new HttpsError(
       "failed-precondition",
-      "SLOT_TOO_SOON: New slot must be at least 25 minutes from now.",
+      `SLOT_TOO_SOON: New slot must be at least ${Math.round(minLeadMs / 60000)} minutes from now.`,
     );
   }
 
@@ -1935,6 +1938,31 @@ exports.removeSalonTeamMember = onCall(async (request) => {
 // Users file reports from the app (reports/{id}). On create we email the admin's
 // configured recipients (report_config/settings.notify_emails); when a report is
 // marked resolved we push an FCM notification to the reporter.
+
+
+/**
+ * Minimum minutes ahead a slot may be booked, server side.
+ *
+ * The apps only OFFER slots `booking_min_lead_minutes` ahead (default 30). The server accepts
+ * a slot LEAD_GRACE_MINUTES sooner so a customer who spends a few minutes on checkout is not
+ * rejected at the last step — that five-minute gap was the original 30-vs-25 split, kept
+ * deliberately. Admins change one number in app_config/settings and both sides follow.
+ */
+const LEAD_GRACE_MINUTES = 5;
+const DEFAULT_LEAD_MINUTES = 30;
+
+async function serverMinLeadMs() {
+  let lead = DEFAULT_LEAD_MINUTES;
+  try {
+    const snap = await admin.firestore().collection("app_config").doc("settings").get();
+    const v = snap.exists ? Number(snap.data().booking_min_lead_minutes) : NaN;
+    // A misconfigured value must not make booking impossible or unguarded.
+    if (Number.isFinite(v) && v >= 10 && v <= 240) lead = v;
+  } catch (err) {
+    logger.warn("serverMinLeadMs: falling back to default lead time", err);
+  }
+  return Math.max(1, lead - LEAD_GRACE_MINUTES) * 60 * 1000;
+}
 
 exports.onReportCreated = onDocumentCreated(
   {document: "reports/{reportId}", secrets: [SMTP_USER, SMTP_PASS]},

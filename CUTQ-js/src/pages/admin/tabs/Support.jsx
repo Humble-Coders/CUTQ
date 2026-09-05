@@ -14,6 +14,8 @@ import {
   saveSupportFaqs,
   listenPrivacyPolicy,
   savePrivacyPolicy,
+  listenTerms,
+  saveTerms,
 } from "../../../lib/adminFirestore";
 
 // ─── Main Support Tab ─────────────────────────────────────────────────────────
@@ -25,6 +27,7 @@ export default function Support() {
     { id: "contact", label: "Contact Info" },
     { id: "faqs",    label: "FAQs" },
     { id: "policy",  label: "Privacy Policy" },
+    { id: "terms",   label: "Terms & Conditions" },
   ];
 
   return (
@@ -57,6 +60,7 @@ export default function Support() {
         {section === "contact" && <ContactSection />}
         {section === "faqs"    && <FaqsSection />}
         {section === "policy"  && <PolicySection />}
+        {section === "terms"   && <TermsSection />}
       </div>
     </div>
   );
@@ -343,7 +347,32 @@ function PolicySection() {
   );
 }
 
-function PolicyEditor({ type }) {
+// ─── Terms & Conditions Section ───────────────────────────────────────────────
+//
+// Deliberately user-only for now: the sign-in consent line in the customer apps is the thing
+// that needs a reachable document, and there is no salon-dashboard equivalent yet.
+
+function TermsSection() {
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <span className="text-sm text-gray-400">Terms &amp; Conditions</span>
+        <span className="text-xs text-gray-500 bg-white/5 rounded px-2 py-1">
+          Shown in user app — linked from the sign-in screen and Profile
+        </span>
+      </div>
+      <PolicyEditor
+        key="terms-user"
+        type="user"
+        listen={listenTerms}
+        save={saveTerms}
+        docLabel="terms &amp; conditions"
+      />
+    </div>
+  );
+}
+
+function PolicyEditor({ type, listen = listenPrivacyPolicy, save = savePrivacyPolicy, docLabel = "privacy policy" }) {
   const [saving, setSaving]   = useState(false);
   const [loaded, setLoaded]   = useState(false);
 
@@ -366,14 +395,14 @@ function PolicyEditor({ type }) {
 
   // Load from Firestore
   useEffect(() => {
-    const unsub = listenPrivacyPolicy(type, ({ html }) => {
+    const unsub = listen(type, ({ html }) => {
       if (!loaded && editor && html) {
         editor.commands.setContent(html);
         setLoaded(true);
       }
     });
     return unsub;
-  }, [type, editor, loaded]);
+  }, [type, editor, loaded, listen]);
 
   async function handleSave() {
     if (!editor) return;
@@ -384,8 +413,8 @@ function PolicyEditor({ type }) {
     }
     setSaving(true);
     try {
-      await savePrivacyPolicy(type, html);
-      toast.success(`${type === "user" ? "User" : "Salon"} privacy policy saved`);
+      await save(type, html);
+      toast.success(`${type === "user" ? "User" : "Salon"} ${docLabel} saved`);
     } catch {
       toast.error("Failed to save policy");
     } finally {

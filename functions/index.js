@@ -1521,6 +1521,16 @@ exports.createSupportRep = onCall(async (request) => {
 // All ledger traffic is proxied here (the API's CORS blocks the dashboard origin).
 // Each call is authorized as the salon owner (or an ADMIN). See ledger.js.
 
+// A disabled account keeps a valid ID token until it expires, so every gate below
+// re-checks the flag server-side. The dashboard applies the same test at sign-in
+// (src/lib/access.js); without it here, disabling someone only takes effect when
+// their token happens to lapse.
+function assertEnabled(prof) {
+  if (!prof?.isEnabled) {
+    throw new HttpsError("permission-denied", "This account is disabled.");
+  }
+}
+
 // Verify the caller owns `salonId` (or is an ADMIN). Returns the salon data.
 // Owner-only — team management must never be delegable, so this stays strict.
 async function assertSalonOwner(auth, salonId) {
@@ -1529,8 +1539,9 @@ async function assertSalonOwner(auth, salonId) {
   const snap = await admin.firestore().collection("salons").doc(salonId).get();
   if (!snap.exists) throw new HttpsError("not-found", "Salon not found.");
   const salon = snap.data();
+  const prof = await getUserProfile(auth.uid);
+  assertEnabled(prof);
   if (salon.owner_uid !== auth.uid) {
-    const prof = await getUserProfile(auth.uid);
     if (String(prof?.Role || "").toUpperCase() !== "ADMIN") {
       throw new HttpsError("permission-denied", "Not authorized for this salon.");
     }
@@ -1548,9 +1559,9 @@ async function assertSalonAccess(auth, salonId, moduleId) {
   const snap = await admin.firestore().collection("salons").doc(salonId).get();
   if (!snap.exists) throw new HttpsError("not-found", "Salon not found.");
   const salon = snap.data();
-  if (salon.owner_uid === auth.uid) return salon;
-
   const prof = await getUserProfile(auth.uid);
+  assertEnabled(prof);
+  if (salon.owner_uid === auth.uid) return salon;
   if (String(prof?.Role || "").toUpperCase() === "ADMIN") return salon;
 
   const access = prof?.salon_access?.[salonId];
